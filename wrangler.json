@@ -1,0 +1,36 @@
+{
+  "name": "station-tycho",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-21",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS"
+  },
+  "r2_buckets": [
+    {
+      "binding": "MOON_BUCKET",
+      "bucket_name": "lunar-assets",
+      "preview_bucket_name": "lunar-assets-local"
+    }
+  ],
+  "env": {
+    "uat": {
+      "name": "station-tycho-uat",
+      "r2_buckets": [
+        {
+          "binding": "MOON_BUCKET",
+          "bucket_name": "lunar-assets"
+        }
+      ]
+    },
+    "production": {
+      "name": "station-tycho",
+      "r2_buckets": [
+        {
+          "binding": "MOON_BUCKET",
+          "bucket_name": "lunar-assets"
+        }
+      ]
+    }
+  }
+}
