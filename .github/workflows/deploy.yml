@@ -23,7 +23,7 @@ jobs:
 
       - name: Compile Rust to WASM
         run: |
-          wasm-pack build --target web --out-dir ./dist/pkg
+          wasm-pack build ./crate --target web --out-dir ../dist/pkg
           cp ./static/index.html ./dist/index.html
 
       - name: Setup Node.js

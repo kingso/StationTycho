@@ -1,0 +1,20 @@
+{
+  "name": "station-tycho",
+  "version": "0.1.0",
+  "private": true,
+  "description": "StationTycho — Cloudflare Worker edge router fronting a Rust/WASM WebGPU lunar visualizer.",
+  "scripts": {
+    "build:wasm": "wasm-pack build ./crate --target web --out-dir ../dist/pkg",
+    "build:static": "node -e \"require('fs').copyFileSync('static/index.html','dist/index.html')\"",
+    "build": "npm run build:wasm && npm run build:static",
+    "dev": "wrangler dev",
+    "deploy:uat": "wrangler deploy --env uat",
+    "deploy:production": "wrangler deploy --env production",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241106.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.90.0"
+  }
+}
