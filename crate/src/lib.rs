@@ -10,7 +10,7 @@ pub fn start() -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn greet(name: &str) -> String {
-    format!("Welcome to Station Tycho, {}.", name)
+    format!("Welcome to Station Tycho (KO), {}.", name)
 }
 
 #[wasm_bindgen]
