@@ -8,7 +8,10 @@
     "build:static": "node -e \"require('fs').copyFileSync('static/index.html','dist/index.html')\"",
     "build": "npm run build:wasm && npm run build:static",
     "dev": "wrangler dev",
+    "check:dist": "node -e \"if(!require('fs').existsSync('dist')){console.error('dist/ not found. Run: npm run build');process.exit(1)}\"",
+    "predeploy:uat": "npm run check:dist",
     "deploy:uat": "wrangler deploy --env uat",
+    "predeploy:production": "npm run check:dist",
     "deploy:production": "wrangler deploy --env production",
     "typecheck": "tsc --noEmit"
   },
