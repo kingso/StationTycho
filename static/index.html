@@ -84,8 +84,8 @@
       </div>
     </main>
 
-    <script type="module">
-      import init, { greet } from "./pkg/station_tycho_engine.js";
+<script type="module">
+      import init, { greet, ping_r2_asset } from "./pkg/station_tycho_engine.js";
 
       const status = document.getElementById("status");
 
@@ -93,9 +93,10 @@
         try {
           await init();
           const gpu = "gpu" in navigator;
+          const r2Status = await ping_r2_asset("test_tile.ktx2");
           status.textContent = gpu
-            ? `${greet("Operator")} WebGPU ready.`
-            : `${greet("Operator")} WebGPU unavailable — falling back.`;
+            ? `${greet("Operator")} WebGPU ready. [R2 Edge: HTTP ${r2Status}]`
+            : `${greet("Operator")} WebGPU unavailable — falling back. [R2 Edge: HTTP ${r2Status}]`;
           status.classList.add("ready");
         } catch (err) {
           status.textContent = `Engine failed to load: ${err}`;
