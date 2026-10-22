@@ -3,12 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "description": "StationTycho — Cloudflare Worker edge router fronting a Rust/WASM WebGPU lunar visualizer.",
-  "scripts": {
+"scripts": {
     "build:wasm": "wasm-pack build ./crate --target web --out-dir ../dist/pkg",
-    "build:static": "node -e \"require('fs').copyFileSync('static/index.html','dist/index.html')\"",
+    "build:static": "node -e \"const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.copyFileSync('static/index.html','dist/index.html')\"",
     "build": "npm run build:wasm && npm run build:static",
+    "check:dist": "node -e \"if(!require('fs').existsSync('dist/index.html')){console.error('dist/ build not found. Run: npm run build');process.exit(1)}\"",
+    "predev": "npm run check:dist",
     "dev": "wrangler dev",
-    "check:dist": "node -e \"if(!require('fs').existsSync('dist')){console.error('dist/ not found. Run: npm run build');process.exit(1)}\"",
+    "dev:remote": "wrangler dev --remote",
     "predeploy:uat": "npm run check:dist",
     "deploy:uat": "wrangler deploy --env uat",
     "predeploy:production": "npm run check:dist",
@@ -16,8 +18,8 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20241106.0",
+    "@cloudflare/workers-types": "^5.20261022.1",
     "typescript": "^5.6.0",
-    "wrangler": "^3.90.0"
+    "wrangler": "^4.151.3"
   }
 }
