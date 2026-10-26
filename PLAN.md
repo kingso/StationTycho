@@ -177,3 +177,52 @@ lunar-assets/
 - KTX2 transcoder choice (`basis_universal` via C++ → WASM vs. a pure-Rust alternative) and when to adopt it.
 - Whether to support adapters without WebGPU at all (WebGL2 backend in wgpu) or show an unsupported message only.
 - Hosting R2 tiles on a custom domain instead of serving them through the Worker.
+
+---
+
+## 9. Development Plan & Rules
+
+### 9.1 Branching model
+- `main` is the release branch. `dev` is the integration branch.
+- Every piece of work is a short-lived `feature/*` branch cut from `dev` and merged back into `dev` through a PR.
+- Merge `dev` into `main` (fast-forward) only when `dev` builds and the last milestone's verification has passed.
+- Documentation-only changes (such as this file) may be committed straight to `dev`.
+
+### 9.2 Branches and merge points
+| # | Branch | Scope | Depends on | Merge into `dev` when |
+|---|---|---|---|---|
+| 1 | `feature/phase1-foundation` | Default device limits, resize/DPI, `Depth32Float` reversed-Z, unsupported-browser message, commit `Cargo.lock` (remove from `.gitignore`), move shader to `shaders/test.wgsl` | none | Resize keeps the triangle sharp at any window size, `npm run build` passes, and a clear message shows when WebGPU is missing |
+| 2 | `feature/worker-edge-cache` | `src/index.ts`: Cache API, `ETag` / `If-None-Match`, `Range`, tighter CORS | none (parallel) | Repeat request returns `cf-cache-status: HIT`, matching `ETag` returns 304, `npm run typecheck` passes. Merge before M3 is verified |
+| 3 | `feature/m2-camera-depth` | Add `glam`, f64 orbit camera, camera-relative rendering, mouse/touch controls, projection | 1 | A test object stays steady (no jitter) while orbiting and zooming close |
+| 4 | `feature/m2-sphere-wireframe` | `latlon_to_cube` and inverse, cube-to-sphere mapping, 6-face sphere drawn as lines | 3 | 60 FPS sphere, orbit works, round-trip lat/lon test passes |
+| 5 | `feature/m3.5-asset-pipeline` | Offline tooling (e.g. `tools/`): cube-face reprojection, 257×257 tiling, `u16` quantization, `manifest.json`, upload script | none (parallel) | Manifest validates and neighbouring tiles have identical edge heights |
+| 6 | `feature/m3-r2-textures` | Fetch test RGBA8 + `u16` DEM tiles from `/assets/v1/...`, upload to GPU textures, texture the sphere | 2, 4 | Sphere shows the R2 texture and the second load comes from the edge cache |
+| 7 | `feature/m4-quadtree-lod` | Quadtree, screen-space-error selection, frustum and horizon culling, parent-until-children-ready rule | 4 | Tiles split and merge smoothly while zooming, no holes, using placeholder heights |
+| 8 | `feature/m4-tile-streaming` | Fetcher with limited concurrency, `AbortController` cancellation, LRU cache with GPU memory budget | 5, 6, 7 | Panning/zooming keeps requests within the limit, cancelled tiles stop loading, memory stays under budget |
+| 9 | `feature/m4-terrain-displacement` | Tile-relative displacement from DEM heights, edge skirts, overlap-aware tile edges | 8 | Tycho's rim and central peak visible, no cracks between LOD levels |
+| 10 | `feature/m4.5-lighting` | Lommel-Seeliger shading with Lambert blend, sun controls, albedo texturing | 9 | Terminator and lit terrain look correct, sun direction responds to controls |
+| 11 | `feature/m4.5-shadows` | Horizon maps (offline pipeline addition plus shader) or a shadow map | 10, 5 | Terminator crossing Tycho shows relief shadows |
+| 12 | `feature/m5-picking-hud` | CPU-side height data, ray picking, lat/lon/altitude readout, streaming stats | 9 | Clicking Tycho's centre reads about 43.3°S, 11.2°W |
+
+```mermaid
+graph LR
+  P1[1 phase1-foundation] --> C[3 m2-camera-depth] --> S[4 m2-sphere-wireframe]
+  W[2 worker-edge-cache] --> T[6 m3-r2-textures]
+  S --> T
+  A[5 m3.5-asset-pipeline] --> ST[8 m4-tile-streaming]
+  S --> Q[7 m4-quadtree-lod] --> ST
+  T --> ST --> D[9 m4-terrain-displacement]
+  D --> L[10 m4.5-lighting] --> SH[11 m4.5-shadows]
+  D --> H[12 m5-picking-hud]
+```
+
+- Branches 2 and 5 touch different files from the engine (`src/index.ts` and `tools/`), so they can run at any time without conflicts.
+- Branches 11 and 12 can run in parallel once branches 10 and 9 are in.
+
+### 9.3 Rules
+- **Build gate:** `npm run build` and `npm run typecheck` must pass before merging into `dev`.
+- **Tags:** tag `dev` after each engine milestone: `m2-done` (after 4), `m3-done` (after 6), `m4-done` (after 9), `m4.5-done` (after 11), `m5-done` (after 12).
+- **Tile format first:** test tiles used in branch 6 must already follow the 257×257, `u16` layout and `/v1/` key scheme in §4.2–4.3, so branch 6 doesn't change when branch 5 lands.
+- **Rebase:** rebase long-running branches (7 to 9) onto `dev` regularly.
+- **Dependencies:** keep `Cargo.lock` committed so wgpu and other crate versions are reproducible.
+- **Model choice:** routine edits suit a faster model. Use the strongest reasoning model for branches 3, 4, 5, 7 and 9 (precision maths, reversed-Z, SSE and horizon culling, reprojection), where bugs only show at certain altitudes.
