@@ -77,7 +77,7 @@
   </head>
   <body>
     <main>
-      <canvas id="viewport" width="1280" height="720"></canvas>
+      <canvas id="viewport"></canvas>
       <div id="hud">
         <h1>Station Tycho</h1>
         <p id="status">Booting lunar engine&hellip;</p>
@@ -92,40 +92,73 @@
       } from "./pkg/station_tycho_engine.js";
 
       const status = document.getElementById("status");
+      const canvas = document.getElementById("viewport");
+
+      const UNSUPPORTED =
+        "WebGPU is not available in this browser. Use a recent version of Chrome or Edge.";
+
+      function observeCanvasSize(onSize) {
+        const observer = new ResizeObserver(([entry]) => {
+          const px = entry.devicePixelContentBoxSize?.[0];
+          const dpr = window.devicePixelRatio || 1;
+          const width = px ? px.inlineSize : Math.round(entry.contentBoxSize[0].inlineSize * dpr);
+          const height = px ? px.blockSize : Math.round(entry.contentBoxSize[0].blockSize * dpr);
+          onSize(width, height);
+        });
+        try {
+          observer.observe(canvas, { box: "device-pixel-content-box" });
+        } catch {
+          observer.observe(canvas, { box: "content-box" });
+        }
+      }
 
       async function boot() {
         try {
+          if (!("gpu" in navigator)) {
+            status.textContent = UNSUPPORTED;
+            return;
+          }
+
           await init();
-          const gpu = "gpu" in navigator;
           const r2Status = await ping_r2_asset("test_tile.ktx2");
 
-          if (gpu) {
-            const renderer = await init_render_engine("viewport");
-            const base = `${greet("Operator")} WebGPU Engine Online. [R2 Edge: HTTP ${r2Status}]`;
-            status.textContent = base;
-
-            let frames = 0;
-            let lastFpsUpdate = performance.now();
-            const loop = (t) => {
-              try {
-                renderer.render(t);
-              } catch (err) {
-                status.textContent = `Render loop stopped: ${err}`;
-                console.error(err);
-                return;
-              }
-              frames++;
-              if (t - lastFpsUpdate >= 1000) {
-                status.textContent = `${base} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS`;
-                frames = 0;
-                lastFpsUpdate = t;
-              }
-              requestAnimationFrame(loop);
-            };
-            requestAnimationFrame(loop);
-          } else {
-            status.textContent = `${greet("Operator")} WebGPU unavailable — falling back. [R2 Edge: HTTP ${r2Status}]`;
+          const dpr = window.devicePixelRatio || 1;
+          let renderer;
+          try {
+            renderer = await init_render_engine(
+              "viewport",
+              Math.round(canvas.clientWidth * dpr),
+              Math.round(canvas.clientHeight * dpr),
+            );
+          } catch (err) {
+            status.textContent = `${UNSUPPORTED} (${err})`;
+            console.error(err);
+            return;
           }
+          observeCanvasSize((w, h) => renderer.resize(w, h));
+
+          const base = `${greet("Operator")} WebGPU Engine Online. [R2 Edge: HTTP ${r2Status}]`;
+          status.textContent = base;
+
+          let frames = 0;
+          let lastFpsUpdate = performance.now();
+          const loop = (t) => {
+            try {
+              renderer.render(t);
+            } catch (err) {
+              status.textContent = `Render loop stopped: ${err}`;
+              console.error(err);
+              return;
+            }
+            frames++;
+            if (t - lastFpsUpdate >= 1000) {
+              status.textContent = `${base} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS`;
+              frames = 0;
+              lastFpsUpdate = t;
+            }
+            requestAnimationFrame(loop);
+          };
+          requestAnimationFrame(loop);
           status.classList.add("ready");
         } catch (err) {
           status.textContent = `Engine failed to load: ${err}`;

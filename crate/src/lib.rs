@@ -28,34 +28,24 @@ pub async fn ping_r2_asset(asset_name: &str) -> Result<JsValue, JsValue> {
     Ok(JsValue::from_f64(resp.status() as f64))
 }
 
-const TEST_SHADER: &str = r#"
-struct Uniforms { time: f32, aspect: f32, _pad: vec2<f32> };
-@group(0) @binding(0) var<uniform> u: Uniforms;
+const TEST_SHADER: &str = include_str!("shaders/test.wgsl");
 
-struct VsOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) color: vec3<f32>,
-};
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-@vertex
-fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
-    var p = array<vec2<f32>, 3>(vec2(0.0, 0.6), vec2(-0.52, -0.3), vec2(0.52, -0.3));
-    var c = array<vec3<f32>, 3>(vec3(1.0, 0.2, 0.3), vec3(0.2, 1.0, 0.4), vec3(0.3, 0.5, 1.0));
-    let s = sin(u.time);
-    let co = cos(u.time);
-    let v = p[i];
-    let r = vec2(v.x * co - v.y * s, v.x * s + v.y * co);
-    var out: VsOut;
-    out.pos = vec4(r.x / u.aspect, r.y, 0.0, 1.0);
-    out.color = c[i] * (0.75 + 0.25 * sin(u.time * 3.0 + f32(i) * 2.094));
-    return out;
+fn create_depth_target(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Depth Texture"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
-
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4(in.color, 1.0);
-}
-"#;
 
 #[wasm_bindgen]
 pub struct Renderer {
@@ -66,10 +56,28 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    _depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
 }
 
 #[wasm_bindgen]
 impl Renderer {
+    /// Resizes the drawing surface and depth buffer to `width` x `height` device pixels.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        let max = self.device.limits().max_texture_dimension_2d;
+        let width = width.clamp(1, max);
+        let height = height.clamp(1, max);
+        if width == self.config.width && height == self.config.height {
+            return;
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.device, &self.config);
+        let (texture, view) = create_depth_target(&self.device, width, height);
+        self._depth_texture = texture;
+        self.depth_view = view;
+    }
+
     /// Renders one frame of the test animation. `time_ms` is the requestAnimationFrame timestamp.
     pub fn render(&mut self, time_ms: f64) -> Result<(), JsValue> {
         let t = (time_ms / 1000.0) as f32;
@@ -113,7 +121,14 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
                 multiview_mask: None,
@@ -130,7 +145,7 @@ impl Renderer {
 }
 
 #[wasm_bindgen]
-pub async fn init_render_engine(canvas_id: &str) -> Result<Renderer, JsValue> {
+pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Result<Renderer, JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("No global window"))?;
     let document = window.document().ok_or_else(|| JsValue::from_str("No document"))?;
     let canvas = document
@@ -165,29 +180,29 @@ pub async fn init_render_engine(canvas_id: &str) -> Result<Renderer, JsValue> {
 
     console::log_1(&"WebGPU adapter acquired successfully.".into());
 
-// 4. Request device and queue using the adapter's native reported limits
-    let limits = adapter.limits();
+    // 4. Request device and queue with spec-default limits so behaviour matches across GPUs
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("StationTycho Device"),
             required_features: wgpu::Features::empty(),
-            required_limits: limits,
+            required_limits: wgpu::Limits::default(),
             ..Default::default()
         })
         .await
         .map_err(|e| JsValue::from_str(&format!("Failed to request device: {:?}", e)))?;
 
     // 5. Configure surface dimensions and format
-    let width = canvas.width();
-    let height = canvas.height();
+    let max_dim = device.limits().max_texture_dimension_2d;
+    let width = width.clamp(1, max_dim);
+    let height = height.clamp(1, max_dim);
     let caps = surface.get_capabilities(&adapter);
     let surface_format = caps.formats[0];
 
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: surface_format,
-        width: if width > 0 { width } else { 1 },
-        height: if height > 0 { height } else { 1 },
+        width,
+        height,
         present_mode: wgpu::PresentMode::AutoVsync,
         alpha_mode: caps.alpha_modes[0],
         view_formats: vec![],
@@ -260,11 +275,19 @@ pub async fn init_render_engine(canvas_id: &str) -> Result<Renderer, JsValue> {
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Greater),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
     });
+
+    let (depth_texture, depth_view) = create_depth_target(&device, width, height);
 
     console::log_1(&"StationTycho WebGPU test pipeline ready.".into());
     Ok(Renderer {
@@ -275,5 +298,7 @@ pub async fn init_render_engine(canvas_id: &str) -> Result<Renderer, JsValue> {
         pipeline,
         uniform_buffer,
         bind_group,
+        _depth_texture: depth_texture,
+        depth_view,
     })
 }
