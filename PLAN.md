@@ -27,24 +27,24 @@ The Rust/WASM engine renders on the client GPU and streams multi-resolution luna
 
 ---
 
-## 2. Phase 1 — Engine Foundation
+## 2. Phase 1 — Engine Foundation — DONE
 
 ### 2.1 Browser compatibility — DONE
 - Upgraded `wgpu` 0.20 → 30. wgpu 0.20 always sent the removed `maxInterStageShaderComponents` limit, which Chrome rejects.
 - Request only the limits the engine needs (start from `wgpu::Limits::default()`), not `adapter.limits()`, so behaviour is the same on every device.
 
-### 2.2 Frame loop
+### 2.2 Frame loop — DONE
 - Current: JS `requestAnimationFrame` calls `Renderer.render(t)` (a `#[wasm_bindgen]` struct). Keep this model; it keeps lifetimes simple and the HUD in JS.
 - A surface that is Lost or Outdated triggers a reconfigure. Timeout or Occluded skips the frame.
 
-### 2.3 Resize & DPI
+### 2.3 Resize & DPI — DONE
 - Remove the fixed `width`/`height` attributes from the canvas.
 - Watch the canvas with a `ResizeObserver` using `devicePixelContentBoxSize`. Call `Renderer.resize(w, h)`, which reconfigures the surface and rebuilds the depth texture.
 
-### 2.4 Depth
+### 2.4 Depth — DONE
 - `Depth32Float`, **reversed-Z**: clear to `0.0`, compare with `Greater`, infinite-far perspective projection.
 
-### 2.5 Fallback
+### 2.5 Fallback — DONE
 - If `navigator.gpu` is missing or getting the adapter fails, show a clear unsupported-browser message (no WebGL fallback for now).
 
 ---
@@ -164,7 +164,7 @@ lunar-assets/
 | Milestone | Deliverable | Verification |
 |---|---|---|
 | **M1: Heartbeat** ✅ | wgpu 30, animated test pipeline, FPS readout | Rotating triangle at refresh rate; HUD shows `WebGPU Engine Online` |
-| **M2: 3D foundation** | f64 orbit camera, camera-relative rendering, reversed-Z depth, resize/DPI, procedural sphere (6 faces, line-list wireframe) | 60 FPS sphere, mouse orbit/zoom, no jitter at 1 m altitude |
+| **M2: 3D foundation** | f64 orbit camera, camera-relative rendering, procedural sphere (6 faces, line-list wireframe). Reversed-Z depth and resize/DPI were delivered in Phase 1 | 60 FPS sphere, mouse orbit/zoom, no jitter at 1 m altitude |
 | **M3: R2 textures** | Fetch a raw RGBA8 + `u16` DEM test tile from `/assets/v1/...`, upload with `write_texture` | Sphere textured from R2; second load served from the edge cache (`cf-cache-status: HIT`) |
 | **M3.5: Asset pipeline** | Cube-face reprojection, 257² tiling, quantization, manifest, upload script | Manifest validates; neighbouring tiles share identical edge heights |
 | **M4: Quadtree terrain** | SSE + horizon culling, skirts, tile-relative displacement, LRU cache, prioritized fetching | Tycho rim and central peak visible; no cracks or holes while zooming |
@@ -191,7 +191,7 @@ lunar-assets/
 ### 9.2 Branches and merge points
 | # | Branch | Scope | Depends on | Merge into `dev` when |
 |---|---|---|---|---|
-| 1 | `feature/phase1-foundation` | Default device limits, resize/DPI, `Depth32Float` reversed-Z, unsupported-browser message, commit `Cargo.lock` (remove from `.gitignore`), move shader to `shaders/test.wgsl` | none | Resize keeps the triangle sharp at any window size, `npm run build` passes, and a clear message shows when WebGPU is missing |
+| 1 | `feature/phase1-foundation` ✅ | Default device limits, resize/DPI, `Depth32Float` reversed-Z, unsupported-browser message, commit `Cargo.lock` (remove from `.gitignore`), move shader to `shaders/test.wgsl` | none | Resize keeps the triangle sharp at any window size, `npm run build` passes, and a clear message shows when WebGPU is missing |
 | 2 | `feature/worker-edge-cache` | `src/index.ts`: Cache API, `ETag` / `If-None-Match`, `Range`, tighter CORS | none (parallel) | Repeat request returns `cf-cache-status: HIT`, matching `ETag` returns 304, `npm run typecheck` passes. Merge before M3 is verified |
 | 3 | `feature/m2-camera-depth` | Add `glam`, f64 orbit camera, camera-relative rendering, mouse/touch controls, projection | 1 | A test object stays steady (no jitter) while orbiting and zooming close |
 | 4 | `feature/m2-sphere-wireframe` | `latlon_to_cube` and inverse, cube-to-sphere mapping, 6-face sphere drawn as lines | 3 | 60 FPS sphere, orbit works, round-trip lat/lon test passes |
