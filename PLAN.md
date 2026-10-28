@@ -120,11 +120,8 @@ lunar-assets/
 Pixel layout: row-major, pixel `(x, y)` of a level-0 tile sits at face coordinates `u = -1 + 2x/256`, `v = -1 + 2y/256` (face axes as in `Face::axes` in `crate/src/geometry.rs`). Synthetic tiles in this layout come from `npm run tiles:test` (`npm run tiles:test:local` also uploads them to the local bucket).
 
 ### 4.4 Worker (`src/index.ts`)
-- Already done: `Cache-Control: public, max-age=31536000, immutable`.
-- Add **Cache API** (`caches.default`) lookups and stores. Worker responses are not cached at the edge automatically.
-- Add `ETag` / `If-None-Match` support using R2 `httpEtag` and `onlyIf`.
-- Add `Range` support (R2 `get(key, { range })`) for a packed bundle of levels 0–3.
-- Restrict CORS to the app origin (or drop it, since requests are same-origin).
+- Already done: `Cache-Control: public, max-age=31536000, immutable`, Cache API (`caches.default`), `ETag` / `If-None-Match`, `Range`, and same-origin only (no CORS header).
+- Note: the Cache API is per data centre, so the first request in each location is a miss.
 
 ---
 
@@ -167,7 +164,7 @@ Pixel layout: row-major, pixel `(x, y)` of a level-0 tile sits at face coordinat
 |---|---|---|
 | **M1: Heartbeat** ✅ | wgpu 30, animated test pipeline, FPS readout | Rotating triangle at refresh rate; HUD shows `WebGPU Engine Online` |
 | **M2: 3D foundation** ✅ | f64 orbit camera, camera-relative rendering, procedural sphere (6 faces, line-list wireframe). Reversed-Z depth and resize/DPI were delivered in Phase 1 | 60 FPS sphere, mouse orbit/zoom, no jitter at 1 m altitude |
-| **M3: R2 textures** | Fetch a raw RGBA8 + `u16` DEM test tile from `/assets/v1/...`, upload with `write_texture` | Sphere textured from R2; second load served from the edge cache (`cf-cache-status: HIT`) |
+| **M3: R2 textures** ✅ | Fetch a raw RGBA8 + `u16` DEM test tile from `/assets/v1/...`, upload with `write_texture` | Sphere textured from R2; second load served from the edge cache (`cf-cache-status: HIT`) |
 | **M3.5: Asset pipeline** | Cube-face reprojection, 257² tiling, quantization, manifest, upload script | Manifest validates; neighbouring tiles share identical edge heights |
 | **M4: Quadtree terrain** | SSE + horizon culling, skirts, tile-relative displacement, LRU cache, prioritized fetching | Tycho rim and central peak visible; no cracks or holes while zooming |
 | **M4.5: Lighting** | Lommel-Seeliger shading, sun controls, horizon-map shadows | Terminator crossing Tycho shows correct relief shadows |
@@ -194,11 +191,11 @@ Pixel layout: row-major, pixel `(x, y)` of a level-0 tile sits at face coordinat
 | # | Branch | Scope | Depends on | Merge into `dev` when |
 |---|---|---|---|---|
 | 1 | `feature/phase1-foundation` ✅ | Default device limits, resize/DPI, `Depth32Float` reversed-Z, unsupported-browser message, commit `Cargo.lock` (remove from `.gitignore`), move shader to `shaders/test.wgsl` | none | Resize keeps the triangle sharp at any window size, `npm run build` passes, and a clear message shows when WebGPU is missing |
-| 2 | `feature/worker-edge-cache` | `src/index.ts`: Cache API, `ETag` / `If-None-Match`, `Range`, tighter CORS | none (parallel) | Repeat request returns `cf-cache-status: HIT`, matching `ETag` returns 304, `npm run typecheck` passes. Merge before M3 is verified |
+| 2 | `feature/worker-edge-cache` ✅ | `src/index.ts`: Cache API, `ETag` / `If-None-Match`, `Range`, tighter CORS | none (parallel) | Repeat request returns `cf-cache-status: HIT`, matching `ETag` returns 304, `npm run typecheck` passes. Merge before M3 is verified |
 | 3 | `feature/m2-camera-depth` ✅ | Add `glam`, f64 orbit camera, camera-relative rendering, mouse/touch controls, projection | 1 | A test object stays steady (no jitter) while orbiting and zooming close |
 | 4 | `feature/m2-sphere-wireframe` ✅ | `latlon_to_cube` and inverse, cube-to-sphere mapping, 6-face sphere drawn as lines | 3 | 60 FPS sphere, orbit works, round-trip lat/lon test passes |
 | 5 | `feature/m3.5-asset-pipeline` | Offline tooling (e.g. `tools/`): cube-face reprojection, 257×257 tiling, `u16` quantization, `manifest.json`, upload script | none (parallel) | Manifest validates and neighbouring tiles have identical edge heights |
-| 6 | `feature/m3-r2-textures` | Fetch test RGBA8 + `u16` DEM tiles from `/assets/v1/...`, upload to GPU textures, texture the sphere | 2, 4 | Sphere shows the R2 texture and the second load comes from the edge cache |
+| 6 | `feature/m3-r2-textures` ✅ | Fetch test RGBA8 + `u16` DEM tiles from `/assets/v1/...`, upload to GPU textures, texture the sphere | 2, 4 | Sphere shows the R2 texture and the second load comes from the edge cache |
 | 7 | `feature/m4-quadtree-lod` | Quadtree, screen-space-error selection, frustum and horizon culling, parent-until-children-ready rule | 4 | Tiles split and merge smoothly while zooming, no holes, using placeholder heights |
 | 8 | `feature/m4-tile-streaming` | Fetcher with limited concurrency, `AbortController` cancellation, LRU cache with GPU memory budget | 5, 6, 7 | Panning/zooming keeps requests within the limit, cancelled tiles stop loading, memory stays under budget |
 | 9 | `feature/m4-terrain-displacement` | Tile-relative displacement from DEM heights, edge skirts, overlap-aware tile edges | 8 | Tycho's rim and central peak visible, no cracks between LOD levels |
