@@ -9,7 +9,7 @@ struct Object { origin_rel: vec4<f32>, color: vec4<f32> };
 @group(2) @binding(2) var dem_tex: texture_2d<u32>;
 
 const DEBUG_HEIGHT: u32 = 2u;
-// Quantisation used by tools/make-test-tiles.mjs until the manifest supplies it.
+// Quantisation from tools/cube.mjs (also in manifest.json) until the engine reads the manifest.
 const DEM_SCALE: f32 = 0.5;
 const DEM_OFFSET: f32 = -9200.0;
 

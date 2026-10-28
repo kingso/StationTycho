@@ -3,35 +3,11 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { cubeToLatLon, DEG, FACES, quantizeHeight, TEST_VERSION, TILE, tileKey } from "./cube.mjs";
 
 const OUT_DIR = ".tiles";
-const VERSION = "v1";
-const TILE = 257;
 const MOON_RADIUS = 1_737_400;
-// Must match DEM_SCALE / DEM_OFFSET in crate/src/shaders/terrain.wgsl.
-const DEM_SCALE = 0.5;
-const DEM_OFFSET = -9200;
 const TYCHO = { lat: -43.31, lon: -11.36, radiusM: 42_500 };
-const DEG = Math.PI / 180;
-
-// Same axes as Face::axes in crate/src/geometry.rs: [normal, u, v], with u × v = normal.
-const FACES = {
-  px: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-  nx: [[-1, 0, 0], [0, -1, 0], [0, 0, 1]],
-  py: [[0, 1, 0], [-1, 0, 0], [0, 0, 1]],
-  ny: [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
-  pz: [[0, 0, 1], [0, 1, 0], [-1, 0, 0]],
-  nz: [[0, 0, -1], [0, 1, 0], [1, 0, 0]],
-};
-
-function cubeToLatLon([n, a, b], u, v) {
-  const p = [0, 1, 2].map((i) => n[i] + a[i] * u + b[i] * v);
-  const [x2, y2, z2] = p.map((c) => c * c);
-  const x = p[0] * Math.sqrt(1 - y2 / 2 - z2 / 2 + (y2 * z2) / 3);
-  const y = p[1] * Math.sqrt(1 - z2 / 2 - x2 / 2 + (z2 * x2) / 3);
-  const z = p[2] * Math.sqrt(1 - x2 / 2 - y2 / 2 + (x2 * y2) / 3);
-  return [Math.atan2(z, Math.hypot(x, y)), Math.atan2(y, x)];
-}
 
 function angularDistance(lat1, lon1, lat2, lon2) {
   const h = Math.sin((lat2 - lat1) / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin((lon2 - lon1) / 2) ** 2;
@@ -77,13 +53,12 @@ for (const [face, axes] of Object.entries(FACES)) {
       const i = y * TILE + x;
       const [r, g, b] = albedoAt(lat, lon);
       albedo.set([r, g, b, 255], i * 4);
-      const q = Math.round((heightAt(lat, lon) - DEM_OFFSET) / DEM_SCALE);
-      dem.writeUInt16LE(Math.min(65535, Math.max(0, q)), i * 2);
+      dem.writeUInt16LE(quantizeHeight(heightAt(lat, lon)), i * 2);
     }
   }
   for (const [key, bytes] of [
-    [`${VERSION}/albedo/${face}/0/0/0.rgba`, albedo],
-    [`${VERSION}/dem/${face}/0/0/0.bin`, dem],
+    [tileKey("albedo", face, 0, 0, 0, TEST_VERSION), albedo],
+    [tileKey("dem", face, 0, 0, 0, TEST_VERSION), dem],
   ]) {
     files.push({ key, path: writeTile(key, bytes) });
   }
