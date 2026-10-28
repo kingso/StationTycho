@@ -1,5 +1,5 @@
 use crate::camera::OrbitCamera;
-use crate::geometry::{enu_frame, MOON_RADIUS};
+use crate::geometry::{enu_frame, face_wireframe_chunks, Face, MOON_RADIUS};
 use glam::DVec3;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -15,6 +15,35 @@ const VERTEX_STRIDE: u64 = 24;
 
 const TYCHO_LAT_DEG: f64 = -43.31;
 const TYCHO_LON_DEG: f64 = -11.36;
+
+// 4×4 chunks of 8×8 cells: a 32-line grid per face, chunked so f32 offsets stay small.
+const SPHERE_CHUNKS_PER_FACE: u32 = 4;
+const SPHERE_SEGMENTS_PER_CHUNK: u32 = 8;
+
+fn face_color(face: Face) -> [f32; 4] {
+    match face {
+        Face::Px => [0.43, 0.66, 1.0, 1.0],
+        Face::Nx => [0.30, 0.48, 0.85, 1.0],
+        Face::Py => [0.45, 0.85, 0.90, 1.0],
+        Face::Ny => [0.30, 0.62, 0.70, 1.0],
+        Face::Pz => [0.75, 0.72, 1.0, 1.0],
+        Face::Nz => [0.52, 0.48, 0.82, 1.0],
+    }
+}
+
+fn sphere_wireframe(device: &wgpu::Device) -> Vec<LineMesh> {
+    Face::ALL
+        .iter()
+        .flat_map(|&face| {
+            face_wireframe_chunks(face, SPHERE_CHUNKS_PER_FACE, SPHERE_SEGMENTS_PER_CHUNK)
+                .into_iter()
+                .map(move |chunk| (face, chunk))
+        })
+        .map(|(face, chunk)| {
+            LineMesh::new(device, "Sphere Chunk", chunk.origin, &chunk.vertices, &chunk.indices, face_color(face))
+        })
+        .collect()
+}
 
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
     data.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -292,7 +321,8 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         source: wgpu::ShaderSource::Wgsl(WIREFRAME_SHADER.into()),
     });
 
-    let meshes = vec![tycho_marker(&device)];
+    let mut meshes = sphere_wireframe(&device);
+    meshes.push(tycho_marker(&device));
 
     let object_stride = OBJECT_UNIFORM_SIZE.max(device.limits().min_uniform_buffer_offset_alignment as u64);
     let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -408,10 +438,7 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         object_bind_group,
         object_stride,
         meshes,
-        camera: OrbitCamera {
-            elevation: 35f64.to_radians(),
-            ..OrbitCamera::new(TYCHO_LAT_DEG, TYCHO_LON_DEG, 60.0)
-        },
+        camera: OrbitCamera::new(TYCHO_LAT_DEG, TYCHO_LON_DEG, 3.0 * MOON_RADIUS),
         _depth_texture: depth_texture,
         depth_view,
     })
