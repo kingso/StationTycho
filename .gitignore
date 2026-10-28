@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+.tiles/
 
 # Rust / wasm-pack
 target/

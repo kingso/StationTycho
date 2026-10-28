@@ -90,8 +90,8 @@
 <script type="module">
       import init, {
         greet,
-        ping_r2_asset,
         init_render_engine,
+        fetch_face_tile,
       } from "./pkg/station_tycho_engine.js";
 
       const status = document.getElementById("status");
@@ -117,6 +117,29 @@
 
       function formatAltitude(m) {
         return m >= 10000 ? `${(m / 1000).toFixed(1)} km` : `${m.toFixed(m < 10 ? 2 : 0)} m`;
+      }
+
+      const FACE_COUNT = 6;
+      const DEBUG_WIREFRAME = 1;
+      const DEBUG_HEIGHT = 2;
+
+      async function loadFaceTiles(renderer) {
+        const results = await Promise.allSettled(
+          Array.from({ length: FACE_COUNT }, async (_, face) => renderer.upload_face_tile(await fetch_face_tile(face))),
+        );
+        for (const r of results) if (r.status === "rejected") console.error(r.reason);
+        return results.filter((r) => r.status === "fulfilled").length;
+      }
+
+      // W toggles the wireframe, H toggles the height view.
+      function attachDebugKeys(renderer) {
+        let flags = 0;
+        window.addEventListener("keydown", (e) => {
+          const bit = { w: DEBUG_WIREFRAME, h: DEBUG_HEIGHT }[e.key.toLowerCase()];
+          if (!bit || e.ctrlKey || e.metaKey || e.altKey) return;
+          flags ^= bit;
+          renderer.set_debug_flags(flags);
+        });
       }
 
       // Left drag pans, right or Shift drag rotates/tilts, wheel or pinch zooms.
@@ -168,7 +191,6 @@
           }
 
           await init();
-          const r2Status = await ping_r2_asset("test_tile.ktx2");
 
           const dpr = window.devicePixelRatio || 1;
           let renderer;
@@ -185,9 +207,14 @@
           }
           observeCanvasSize((w, h) => renderer.resize(w, h));
           attachControls(renderer);
+          attachDebugKeys(renderer);
 
-          const base = `${greet("Operator")} WebGPU Engine Online. [R2 Edge: HTTP ${r2Status}]`;
-          status.textContent = base;
+          let tiles = "loading";
+          const base = () => `${greet("Operator")} WebGPU Engine Online. [R2 tiles: ${tiles}]`;
+          status.textContent = base();
+          loadFaceTiles(renderer).then((loaded) => {
+            tiles = `${loaded}/${FACE_COUNT}`;
+          });
 
           let frames = 0;
           let lastFpsUpdate = performance.now();
@@ -201,7 +228,7 @@
             }
             frames++;
             if (t - lastFpsUpdate >= 1000) {
-              status.textContent = `${base} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())}`;
+              status.textContent = `${base()} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())}`;
               frames = 0;
               lastFpsUpdate = t;
             }

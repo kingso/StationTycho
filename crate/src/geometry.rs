@@ -1,5 +1,7 @@
 use glam::DVec3;
 
+use crate::tiles::TILE_SIZE;
+
 /// IAU reference sphere radius of the Moon, in metres.
 pub const MOON_RADIUS: f64 = 1_737_400.0;
 
@@ -33,6 +35,18 @@ pub enum Face {
 
 impl Face {
     pub const ALL: [Face; 6] = [Face::Px, Face::Nx, Face::Py, Face::Ny, Face::Pz, Face::Nz];
+
+    /// Name used in R2 tile keys.
+    pub fn key(self) -> &'static str {
+        match self {
+            Face::Px => "px",
+            Face::Nx => "nx",
+            Face::Py => "py",
+            Face::Ny => "ny",
+            Face::Pz => "pz",
+            Face::Nz => "nz",
+        }
+    }
 
     /// Outward normal and the face's `u` and `v` axes, with `u × v = normal`.
     fn axes(self) -> (DVec3, DVec3, DVec3) {
@@ -100,43 +114,66 @@ pub fn cube_to_latlon(face: Face, u: f64, v: f64) -> (f64, f64) {
     (s.z.atan2(s.x.hypot(s.y)), s.y.atan2(s.x))
 }
 
-/// Line-list grid on part of the reference sphere, as f32 offsets from an f64 `origin`.
+/// Grid on part of the reference sphere, as f32 offsets from an f64 `origin`.
 pub struct ChunkMesh {
     pub origin: DVec3,
-    /// Interleaved `[offset.xyz, normal.xyz]` per vertex.
+    /// Interleaved `[offset.xyz, normal.xyz, uv.xy]` per vertex; `uv` addresses the face's level-0 tile.
     pub vertices: Vec<f32>,
-    pub indices: Vec<u32>,
+    pub triangles: Vec<u32>,
+    pub lines: Vec<u32>,
 }
 
-/// Splits `face` into `chunks × chunks` wireframe chunks of `segments × segments` cells each.
-pub fn face_wireframe_chunks(face: Face, chunks: u32, segments: u32) -> Vec<ChunkMesh> {
+/// Texture coordinate of face coordinate `t` in `[-1, 1]`, landing on texel centres of a shared-border tile.
+pub fn face_to_tile_uv(t: f64) -> f64 {
+    let last = (TILE_SIZE - 1) as f64;
+    ((t + 1.0) * 0.5 * last + 0.5) / TILE_SIZE as f64
+}
+
+/// Splits `face` into `chunks × chunks` chunks of `segments × segments` cells each.
+pub fn face_chunks(face: Face, chunks: u32, segments: u32) -> Vec<ChunkMesh> {
     let side = segments + 1;
     let to_face = |c: u32, s: f64| -1.0 + 2.0 * (c as f64 + s) / chunks as f64;
     let mut out = Vec::with_capacity((chunks * chunks) as usize);
     for cj in 0..chunks {
         for ci in 0..chunks {
             let origin = cube_to_unit(face, to_face(ci, 0.5), to_face(cj, 0.5)) * MOON_RADIUS;
-            let mut vertices = Vec::with_capacity((side * side * 6) as usize);
+            let mut vertices = Vec::with_capacity((side * side * 8) as usize);
             for j in 0..side {
                 for i in 0..side {
-                    let s = cube_to_unit(
-                        face,
-                        to_face(ci, i as f64 / segments as f64),
-                        to_face(cj, j as f64 / segments as f64),
-                    );
+                    let u = to_face(ci, i as f64 / segments as f64);
+                    let v = to_face(cj, j as f64 / segments as f64);
+                    let s = cube_to_unit(face, u, v);
                     let offset = (s * MOON_RADIUS - origin).as_vec3();
                     let normal = s.as_vec3();
-                    vertices.extend_from_slice(&[offset.x, offset.y, offset.z, normal.x, normal.y, normal.z]);
+                    vertices.extend_from_slice(&[
+                        offset.x,
+                        offset.y,
+                        offset.z,
+                        normal.x,
+                        normal.y,
+                        normal.z,
+                        face_to_tile_uv(u) as f32,
+                        face_to_tile_uv(v) as f32,
+                    ]);
                 }
             }
-            let mut indices = Vec::with_capacity((4 * segments * side) as usize);
+            let mut lines = Vec::with_capacity((4 * segments * side) as usize);
             for a in 0..side {
                 for b in 0..segments {
-                    indices.extend_from_slice(&[a * side + b, a * side + b + 1]);
-                    indices.extend_from_slice(&[b * side + a, (b + 1) * side + a]);
+                    lines.extend_from_slice(&[a * side + b, a * side + b + 1]);
+                    lines.extend_from_slice(&[b * side + a, (b + 1) * side + a]);
                 }
             }
-            out.push(ChunkMesh { origin, vertices, indices });
+            // Counter-clockwise seen from outside, because u × v points outward.
+            let mut triangles = Vec::with_capacity((6 * segments * segments) as usize);
+            for j in 0..segments {
+                for i in 0..segments {
+                    let a = j * side + i;
+                    let (b, c, d) = (a + 1, a + side, a + side + 1);
+                    triangles.extend_from_slice(&[a, b, d, a, d, c]);
+                }
+            }
+            out.push(ChunkMesh { origin, vertices, triangles, lines });
         }
     }
     out
@@ -195,16 +232,40 @@ mod tests {
     }
 
     #[test]
-    fn wireframe_chunk_offsets_reconstruct_sphere_points() {
-        let chunks = face_wireframe_chunks(Face::Py, 2, 4);
+    fn chunk_offsets_reconstruct_sphere_points() {
+        let chunks = face_chunks(Face::Py, 2, 4);
         assert_eq!(chunks.len(), 4);
         for chunk in &chunks {
-            assert_eq!(chunk.vertices.len(), 25 * 6);
-            assert_eq!(chunk.indices.len(), 2 * 2 * 4 * 5);
-            for v in chunk.vertices.chunks(6) {
+            assert_eq!(chunk.vertices.len(), 25 * 8);
+            assert_eq!(chunk.lines.len(), 2 * 2 * 4 * 5);
+            assert_eq!(chunk.triangles.len(), 6 * 4 * 4);
+            for v in chunk.vertices.chunks(8) {
                 let p = chunk.origin + DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64);
                 assert!((p.length() - MOON_RADIUS).abs() < 0.1);
             }
         }
+    }
+
+    #[test]
+    fn triangles_face_outward() {
+        for face in Face::ALL {
+            let chunk = &face_chunks(face, 1, 2)[0];
+            let pos = |i: u32| {
+                let v = &chunk.vertices[i as usize * 8..];
+                DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64)
+            };
+            for tri in chunk.triangles.chunks(3) {
+                let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
+                let outward = chunk.origin + (a + b + c) / 3.0;
+                assert!((b - a).cross(c - a).dot(outward) > 0.0, "{face:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tile_uv_hits_edge_texel_centres() {
+        let half_texel = 0.5 / TILE_SIZE as f64;
+        assert!((face_to_tile_uv(-1.0) - half_texel).abs() < 1e-12);
+        assert!((face_to_tile_uv(1.0) - (1.0 - half_texel)).abs() < 1e-12);
     }
 }

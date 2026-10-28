@@ -117,6 +117,8 @@ lunar-assets/
 ```
 `face ∈ {px, nx, py, ny, pz, nz}`. Never overwrite a tile; publish a new `vN` instead.
 
+Pixel layout: row-major, pixel `(x, y)` of a level-0 tile sits at face coordinates `u = -1 + 2x/256`, `v = -1 + 2y/256` (face axes as in `Face::axes` in `crate/src/geometry.rs`). Synthetic tiles in this layout come from `npm run tiles:test` (`npm run tiles:test:local` also uploads them to the local bucket).
+
 ### 4.4 Worker (`src/index.ts`)
 - Already done: `Cache-Control: public, max-age=31536000, immutable`.
 - Add **Cache API** (`caches.default`) lookups and stores. Worker responses are not cached at the edge automatically.
