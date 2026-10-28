@@ -107,17 +107,26 @@ Do **not** use the WAC *Morphology* mosaic for albedo: its shading is baked in a
 4. Quantize the DEM to `u16` with a global `scale` and `offset` (range about −9.2 km to +10.8 km, 0.5 m/LSB).
 5. Write `manifest.json`: per-level tile availability, min/max height per tile, geometric error per level, quantization parameters, dataset version.
 
+**Current implementation** (`tools/pipeline/`, Node, no dependencies; raw data in git-ignored `data/`):
+- `npm run assets:download` fetches ~3.1 GB into `data/raw`: LOLA `LDEM_64` (global, ~474 m/px), the SLDEM2015 512 px/deg tile covering Tycho (60°S–30°S, 315°E–360°E) and the 8 WAC Hapke 643 nm tiles (±70°, ~400 m/px).
+- `npm run assets:build` resamples them (bilinear, straight from simple-cylindrical) into `data/tiles/v2`: levels 0–3 everywhere from `LDEM_64`, levels 4–7 only around Tycho from SLDEM2015, feathered into `LDEM_64` over 0.5°. Albedo poleward of 70° is a flat fill until polar mosaics are added.
+- `npm run assets:validate` checks the manifest, file sizes, complete sibling sets, per-tile min/max and identical heights on every shared edge (including across faces).
+- `npm run assets:upload:local` / `assets:upload:remote` bulk-upload tiles, then the manifest.
+- Not yet: LOLA polar DEMs, LROC NAC DTMs, polar albedo.
+
 ### 4.3 R2 layout (versioned, immutable)
 ```text
 lunar-assets/
-└── v1/
+└── v{N}/
     ├── meta/manifest.json
     ├── dem/{face}/{level}/{x}/{y}.bin       # u16 LE, 257×257
     └── albedo/{face}/{level}/{x}/{y}.rgba   # RGBA8 (KTX2 later)
 ```
 `face ∈ {px, nx, py, ny, pz, nz}`. Never overwrite a tile; publish a new `vN` instead.
 
-Pixel layout: row-major, pixel `(x, y)` of a level-0 tile sits at face coordinates `u = -1 + 2x/256`, `v = -1 + 2y/256` (face axes as in `Face::axes` in `crate/src/geometry.rs`). Synthetic tiles in this layout come from `npm run tiles:test` (`npm run tiles:test:local` also uploads them to the local bucket).
+Pixel layout: row-major, pixel `(x, y)` of a level-0 tile sits at face coordinates `u = -1 + 2x/256`, `v = -1 + 2y/256` (face axes as in `Face::axes` in `crate/src/geometry.rs`). At level `L`, tile `(tx, ty)` covers `u ∈ [-1 + 2tx/2^L, -1 + 2(tx+1)/2^L]`, likewise for `v`.
+
+Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`tiles:test:local` uploads them locally). `v2` is the first real dataset from the pipeline and is what the engine reads.
 
 ### 4.4 Worker (`src/index.ts`)
 - Already done: `Cache-Control: public, max-age=31536000, immutable`, Cache API (`caches.default`), `ETag` / `If-None-Match`, `Range`, and same-origin only (no CORS header).

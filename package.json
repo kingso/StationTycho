@@ -18,7 +18,12 @@
     "typecheck": "tsc --noEmit",
     "test:engine": "cargo test --manifest-path crate/Cargo.toml --lib",
     "tiles:test": "node tools/make-test-tiles.mjs",
-    "tiles:test:local": "node tools/make-test-tiles.mjs --upload-local"
+    "tiles:test:local": "node tools/make-test-tiles.mjs --upload-local",
+    "assets:download": "node tools/pipeline/download.mjs",
+    "assets:build": "node tools/pipeline/build.mjs",
+    "assets:validate": "node tools/pipeline/validate.mjs",
+    "assets:upload:local": "node tools/pipeline/upload.mjs --local",
+    "assets:upload:remote": "node tools/pipeline/upload.mjs --remote"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261022.1",
