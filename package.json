@@ -16,7 +16,9 @@
     "predeploy:production": "npm run check:dist",
     "deploy:production": "wrangler deploy --env production",
     "typecheck": "tsc --noEmit",
-    "test:engine": "cargo test --manifest-path crate/Cargo.toml --lib"
+    "test:engine": "cargo test --manifest-path crate/Cargo.toml --lib",
+    "tiles:test": "node tools/make-test-tiles.mjs",
+    "tiles:test:local": "node tools/make-test-tiles.mjs --upload-local"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261022.1",

@@ -21,6 +21,8 @@ fn vs_main(v: VsIn) -> VsOut {
     let rel = object.origin_rel.xyz + v.offset;
     var out: VsOut;
     out.pos = frame.view_proj * vec4(rel, 1.0);
+    // Pull lines 0.1% towards the camera (reversed-Z) so they don't z-fight the triangles they outline.
+    out.pos.z *= 1.001;
     out.rel = rel;
     out.normal = v.normal;
     return out;
