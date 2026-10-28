@@ -47,6 +47,8 @@
         display: block;
         width: 100%;
         height: 100%;
+        touch-action: none;
+        cursor: grab;
       }
 
       #hud {
@@ -55,6 +57,7 @@
         padding: 16px 20px;
         width: 100%;
         background: linear-gradient(transparent, rgba(5, 6, 10, 0.85));
+        pointer-events: none;
       }
 
       #hud h1 {
@@ -112,6 +115,51 @@
         }
       }
 
+      function formatAltitude(m) {
+        return m >= 10000 ? `${(m / 1000).toFixed(1)} km` : `${m.toFixed(m < 10 ? 2 : 0)} m`;
+      }
+
+      // Left drag pans, right or Shift drag rotates/tilts, wheel or pinch zooms.
+      function attachControls(renderer) {
+        const pointers = new Map();
+        const dpr = () => window.devicePixelRatio || 1;
+        canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+        canvas.addEventListener("pointerdown", (e) => {
+          canvas.setPointerCapture(e.pointerId);
+          pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        });
+        canvas.addEventListener("pointermove", (e) => {
+          const prev = pointers.get(e.pointerId);
+          if (!prev) return;
+          const dx = (e.clientX - prev.x) * dpr();
+          const dy = (e.clientY - prev.y) * dpr();
+          if (pointers.size === 1) {
+            if (e.buttons & 2 || e.shiftKey) renderer.rotate(dx, dy);
+            else renderer.pan(dx, dy);
+          } else if (pointers.size === 2) {
+            const other = [...pointers].find(([id]) => id !== e.pointerId)[1];
+            const before = Math.hypot(prev.x - other.x, prev.y - other.y);
+            const after = Math.hypot(e.clientX - other.x, e.clientY - other.y);
+            if (before > 0 && after > 0) renderer.zoom(before / after);
+            // Each finger contributes half of the midpoint movement.
+            renderer.rotate(dx * 0.5, dy * 0.5);
+          }
+          pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        });
+        const release = (e) => pointers.delete(e.pointerId);
+        canvas.addEventListener("pointerup", release);
+        canvas.addEventListener("pointercancel", release);
+        canvas.addEventListener(
+          "wheel",
+          (e) => {
+            e.preventDefault();
+            const lines = e.deltaMode === 1 ? 40 : 1;
+            renderer.zoom(Math.exp(e.deltaY * lines * 0.0015));
+          },
+          { passive: false },
+        );
+      }
+
       async function boot() {
         try {
           if (!("gpu" in navigator)) {
@@ -136,6 +184,7 @@
             return;
           }
           observeCanvasSize((w, h) => renderer.resize(w, h));
+          attachControls(renderer);
 
           const base = `${greet("Operator")} WebGPU Engine Online. [R2 Edge: HTTP ${r2Status}]`;
           status.textContent = base;
@@ -152,7 +201,7 @@
             }
             frames++;
             if (t - lastFpsUpdate >= 1000) {
-              status.textContent = `${base} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS`;
+              status.textContent = `${base} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())}`;
               frames = 0;
               lastFpsUpdate = t;
             }
