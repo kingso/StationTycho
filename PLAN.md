@@ -79,12 +79,21 @@ Absolute positions (~1.7e6 m) in `f32` resolve only to about 0.2 m, which causes
 ### 3.4 Shared grid mesh
 - One static 65×65 vertex grid plus a **skirt** ring (pushed inward along the normal by a per-level depth) to hide cracks between LOD levels.
 - Index buffer for triangles, and a separate line-list index buffer for wireframe. WebGPU has no polygon-mode line.
+- The terrain pipeline has a slope-scaled depth bias (pushing the surface back) so wireframe lines on its edges stay visible at grazing angles. Once heights are applied, the wireframe shader must displace vertices exactly like the terrain shader, or the lines end up buried under the surface.
 
 ### 3.5 LOD selection
 - Screen-space error: $\rho = \dfrac{\epsilon_{\text{level}} \cdot H_{\text{px}}}{2\,d\,\tan(\text{fov}/2)}$. Split when $\rho > \tau$ (for example 2 px).
 - $\epsilon_{\text{level}}$ = geometric error per level, taken from the manifest (or halved per level).
 - Cull with the view frustum and the **horizon** (the occluding sphere test).
 - Keep a parent visible until all 4 children have loaded, so the terrain never shows holes.
+
+**Current implementation** (`crate/src/lod.rs`):
+- Tiles are 8×8-cell grids sharing one index buffer; each tile mesh is only its vertices, as offsets from its f64 centre.
+- Bounds: per-tile angular radius from its corners and edge midpoints, widened by the maximum terrain height (10.8 km) for both the frustum sphere and the horizon test.
+- $\epsilon$ = max(terrain `geometricError` per level from the v2 manifest, hard-coded until the engine reads the manifest; sag of the tile's flat grid cells). Split threshold 2 px, deepest level 7.
+- Priority refinement: always split the tile with the largest screen-space error; stop at the first split that would exceed the 1,024-tile budget, so a tight budget goes to the nearest terrain.
+- Readiness = mesh built. Missing children are returned as requests (most urgent first); the renderer builds at most 64 per frame and keeps an LRU of 4,096 tile meshes that never evicts roots or the visible tiles and their ancestors.
+- `feature/m4-tile-streaming` will make readiness mean "DEM and albedo loaded" and must account for levels 4–7 only existing around Tycho.
 
 ---
 
@@ -207,7 +216,7 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 | 6 | `feature/m3-r2-textures` ✅ | Fetch test RGBA8 + `u16` DEM tiles from `/assets/v1/...`, upload to GPU textures, texture the sphere | 2, 4 | Sphere shows the R2 texture and the second load comes from the edge cache |
 | 7 | `feature/m4-quadtree-lod` | Quadtree, screen-space-error selection, frustum and horizon culling, parent-until-children-ready rule | 4 | Tiles split and merge smoothly while zooming, no holes, using placeholder heights |
 | 8 | `feature/m4-tile-streaming` | Fetcher with limited concurrency, `AbortController` cancellation, LRU cache with GPU memory budget | 5, 6, 7 | Panning/zooming keeps requests within the limit, cancelled tiles stop loading, memory stays under budget |
-| 9 | `feature/m4-terrain-displacement` | Tile-relative displacement from DEM heights, edge skirts, overlap-aware tile edges | 8 | Tycho's rim and central peak visible, no cracks between LOD levels |
+| 9 | `feature/m4-terrain-displacement` | Tile-relative displacement from DEM heights, edge skirts, overlap-aware tile edges; the wireframe shader shares the same displacement so it stays usable for crack checks | 8 | Tycho's rim and central peak visible, no cracks between LOD levels |
 | 10 | `feature/m4.5-lighting` | Lommel-Seeliger shading with Lambert blend, sun controls, albedo texturing | 9 | Terminator and lit terrain look correct, sun direction responds to controls |
 | 11 | `feature/m4.5-shadows` | Horizon maps (offline pipeline addition plus shader) or a shadow map | 10, 5 | Terminator crossing Tycho shows relief shadows |
 | 12 | `feature/m5-picking-hud` | CPU-side height data, ray picking, lat/lon/altitude readout, streaming stats | 9 | Clicking Tycho's centre reads about 43.3°S, 11.2°W |

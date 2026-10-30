@@ -61,6 +61,13 @@ impl OrbitCamera {
         self.target() - self.forward() * self.distance
     }
 
+    /// Camera-space axes in body-fixed coordinates: right, up, forward.
+    pub fn view_basis(&self) -> (DVec3, DVec3, DVec3) {
+        let (_, right, _) = self.heading_and_right();
+        let forward = self.forward();
+        (right, right.cross(forward), forward)
+    }
+
     pub fn altitude(&self) -> f64 {
         self.position().length() - MOON_RADIUS
     }
