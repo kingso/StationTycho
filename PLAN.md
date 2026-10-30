@@ -267,10 +267,10 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 | 11 | `feature/m4.5-shadows` (deferred) | Horizon maps (decided, §8): bake per-texel horizon angles in the pipeline as a `v3` layer, sample them in the shader | 10, 5 | Terminator crossing Tycho shows relief shadows |
 | 12 | `feature/m5-picking-hud` ✅ | CPU-side height data, ray picking, lat/lon/altitude readout, streaming stats; keep the orbit target and camera above the terrain (the target is on the reference sphere, so over high ground a low camera can end up underground) | 9 | Clicking Tycho's centre reads about 43.3°S, 11.2°W |
 
-| 13 | `feature/m6-feature-data` | `npm run assets:features`: Gazetteer `.dbf` + curated `sites.json` → `features/v1.json`, validation, upload | none (parallel) | Output has all Gazetteer features with valid coordinates; Tycho matches the Gazetteer; upload works locally |
+| 13 | `feature/m6-feature-data` | `npm run assets:features`: Gazetteer `.dbf` → `features/v1.json`, validation, upload (§10.2) | none (parallel) | Output has all Gazetteer features with valid coordinates; Tycho matches the Gazetteer; upload works locally |
 | 14 | `feature/m6-labels` | Batch projection, horizon and terrain occlusion, priority and size thresholds, collision-free placement on a 2D overlay, layer toggles | 12, 13 | Labels stay readable without overlaps at every zoom; nothing behind the Moon or a ridge is labelled; 60 FPS |
 | 15 | `feature/m6-info-search` | Info panel on label click or pick, search with fly-to | 14 | Clicking Tycho shows its Gazetteer details; searching "Copernicus" flies there |
-| 16 | `feature/m6-sites` | Landing sites and points of interest with sources, own icons and layer | 14 | Apollo 11 marker sits at its LROC-measured position (within 100 m) |
+| 16 | `feature/m6-sites` | Curated `sites.json` (landing sites and points of interest, each with its coordinate source) added to the next feature-file version; own icons and layer | 14 | Apollo 11 marker sits at its LROC-measured position (within 100 m) |
 ```mermaid
 graph LR
   P1[1 phase1-foundation] --> C[3 m2-camera-depth] --> S[4 m2-sphere-wireframe]
@@ -296,3 +296,64 @@ graph LR
 - **Rebase:** rebase long-running branches (7 to 9) onto `dev` regularly.
 - **Dependencies:** keep `Cargo.lock` committed so wgpu and other crate versions are reproducible.
 - **Model choice:** routine edits suit a faster model. Use the strongest reasoning model for branches 3, 4, 5, 7 and 9 (precision maths, reversed-Z, SSE and horizon culling, reprojection), where bugs only show at certain altitudes.
+
+---
+
+## 10. Status and Next Phase
+
+### 10.1 Status (2026-10-30)
+- **Done:** M1–M5, plus M4.5's lighting (branch 10). Shadows (branch 11) are decided (horizon maps) but deferred to the `v3` data rebuild (§8). Tags `m1-done` … `m5-done`.
+- **Production** (`tycho.kings.fyi`, `main` at `04446c5`) runs lighting and picking/HUD.
+- **`dev`** (`uat.kings.fyi`) is 3 commits ahead of production: this plan's M6 section and the Tycho coordinate fix (PR #11: Gazetteer centre 43.30°S 11.22°W instead of 43.31°S 11.36°W). Fast-forward `main` when wanted; pushing `main` deploys production, so it needs the owner's go-ahead.
+- **Data:** `v2` tiles (levels 0–3 global, 4–7 around Tycho) are in R2 for both environments.
+
+### 10.2 Next: branch 13 `feature/m6-feature-data`
+Goal: a versioned, compact feature file in R2 that the engine can load in branch 14. No engine changes in this branch. Keep the pipeline dependency-free (Node built-ins only), like `tools/pipeline/`.
+
+1. **Source.** Add the Gazetteer to `tools/pipeline/sources.mjs`, and let `npm run assets:download` fetch it into `data/raw`.
+   - URL: `https://asc-planetarynames-data.s3.us-west-2.amazonaws.com/MOON_nomenclature_center_pts.zip`, about 23.8 MB, regenerated nightly.
+   - Record the download date and size in the output for traceability. The file changes nightly, so a snapshot defines a feature-file version.
+2. **Unzip and read** (`tools/pipeline/dbf.mjs`). Only `MOON_nomenclature_center_pts.dbf` is needed (about 23 MB; the `.shp` points duplicate `center_lat/center_lon`).
+   - **Unzip:** walk the zip's central directory, then inflate that entry with `zlib.inflateRawSync`.
+   - **Read** (dBASE III): record count is a u32 at byte 4, header length a u16 at 8, record length a u16 at 10. Fields are 32-byte descriptors (name, type at 11, length at 16) until `0x0D`. Each record starts with a deletion flag (`*` = deleted); its fields are fixed-width, space-padded UTF-8 text.
+   - Fields to keep: `name`, `type`, `diameter`, `center_lat`, `center_lon` (east 0–360), `origin`, `approval`, `link`. The Gazetteer ID is the number at the end of `link` (Tycho: `.../Feature/6163`).
+3. **Build** (`tools/pipeline/features.mjs` → `npm run assets:features`). Write `data/features/v1.json`:
+   ```json
+   {
+     "version": "v1",
+     "source": { "gazetteer": "MOON_nomenclature_center_pts.zip", "downloaded": "2026-..", "bytes": 23845070 },
+     "types": ["Crater, craters", "Satellite Feature", "Mare, maria", "…"],
+     "features": [[6163, "Tycho", 0, -43.2958, -11.2153, 85.294, "Tycho Brahe; Danish astronomer (1546-1601)."]]
+   }
+   ```
+   - Rows are `[id, name, typeIndex, lat, lon (−180…180), diameterKm, origin]`, rounded to 4 decimals for degrees and 3 for km. Arrays keep it near 1 MB (about 250 KB gzipped).
+   - Decide the `approval` filter from the values actually present (Tycho: "Adopted by IAU"), and count what each choice drops.
+   - Sort by priority: maria and large features first, then by diameter. Branch 14 then reads from the front.
+4. **Validate** (in the build script, failing loudly):
+   - every latitude is in [−90, 90], longitude in [−180, 180) and diameter ≥ 0;
+   - IDs are unique;
+   - the feature count matches the `.dbf` record count minus deleted and filtered records;
+   - Tycho is present at 43.2958°S, 11.2153°W, 85.29 km.
+5. **Upload** (`npm run assets:features:upload:local|remote`): key `features/v1.json`, content type `application/json`, through `wrangler r2 object put` like `upload.mjs`. The Worker already serves `/assets/*` with immutable caching. Never overwrite a version: a new Gazetteer snapshot becomes `features/v2.json`.
+6. **Docs:** document the commands in this file (§6.1) and in the README.
+
+Merge when the row in §9.2 holds: all Gazetteer features with valid coordinates, Tycho matching the Gazetteer, and a local upload that the dev Worker serves at `/assets/features/v1.json`.
+
+### 10.3 Then: branch 14 `feature/m6-labels` (outline)
+- **Engine API:** load the feature file once, after the manifest. Each frame, project candidate features in one batch (Rust, f64, camera-relative) to `[x, y, depth, visible]` in device pixels.
+  - Only consider features whose centre is on a drawn tile and in front of the camera.
+  - Hide any feature behind the terrain: cast `terrain::ray_terrain` from the camera towards its centre; a hit closer than the feature means hidden. Test at most N new features per frame and cache the results.
+- **Placement** (page, 2D canvas overlay above the WebGPU canvas):
+  - Show a label when its projected diameter is at least 40 px. Satellite features also need the camera below about 50 km.
+  - Place greedily in priority order, skipping any label box that overlaps an earlier one.
+  - Fade labels in and out over about 150 ms to avoid popping.
+- **Layer toggles:** craters, other features, sites.
+- **Check:** 60 FPS with labels on at every zoom.
+
+### 10.4 Backlog (not scheduled)
+- **README:** it is only a title. Add setup, `npm run` commands, the data pipeline, debug keys (W/H/C/K/L, `[`/`]`), click-to-pick and the deploy flow (`dev` → UAT, `main` → production).
+- **Tycho marker:** it still sits on the reference sphere, about 2.9 km above the crater floor at Tycho's centre. Put it on the terrain (use `DrawnTerrain`) or remove it.
+- **Camera lift:** it only tilts up. Restore the user's chosen tilt once the terrain allows it.
+- **`v3` data rebuild:** bundle horizon maps (branch 11), a one-texel border ring for exact tile-edge normals, polar DEMs and albedo, and possibly KTX2 compression (§8).
+- **Rendering extras:** Hapke opposition surge, height exaggeration control, texture arrays to cut bind-group changes.
+- **Tooling:** wrangler update available (4.151 → 4.156).
