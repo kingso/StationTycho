@@ -91,7 +91,7 @@
       import init, {
         greet,
         init_render_engine,
-        fetch_face_tile,
+        fetch_manifest,
       } from "./pkg/station_tycho_engine.js";
 
       const status = document.getElementById("status");
@@ -119,16 +119,12 @@
         return m >= 10000 ? `${(m / 1000).toFixed(1)} km` : `${m.toFixed(m < 10 ? 2 : 0)} m`;
       }
 
-      const FACE_COUNT = 6;
       const DEBUG_WIREFRAME = 1;
       const DEBUG_HEIGHT = 2;
 
-      async function loadFaceTiles(renderer) {
-        const results = await Promise.allSettled(
-          Array.from({ length: FACE_COUNT }, async (_, face) => renderer.upload_face_tile(await fetch_face_tile(face))),
-        );
-        for (const r of results) if (r.status === "rejected") console.error(r.reason);
-        return results.filter((r) => r.status === "fulfilled").length;
+      function tileStats(renderer) {
+        const resident = `${renderer.resident_tile_count()}/${renderer.tile_capacity()} (${renderer.tile_gpu_megabytes().toFixed(0)} MB)`;
+        return `Tiles ${renderer.visible_tile_count()} (L${renderer.finest_visible_level()}), resident ${resident}, loading ${renderer.loading_tile_count()}, cancelled ${renderer.cancelled_tile_count()}, failed ${renderer.failed_tile_count()}`;
       }
 
       // W toggles the wireframe, H toggles the height view.
@@ -209,12 +205,19 @@
           attachControls(renderer);
           attachDebugKeys(renderer);
 
-          let tiles = "loading";
-          const base = () => `${greet("Operator")} WebGPU Engine Online. [R2 tiles: ${tiles}]`;
+          let manifest = "loading";
+          const base = () => `${greet("Operator")} WebGPU Engine Online. [Manifest: ${manifest}]`;
           status.textContent = base();
-          loadFaceTiles(renderer).then((loaded) => {
-            tiles = `${loaded}/${FACE_COUNT}`;
-          });
+          fetch_manifest().then(
+            (m) => {
+              renderer.set_manifest(m);
+              manifest = "ok";
+            },
+            (err) => {
+              manifest = "failed";
+              console.error(err);
+            },
+          );
 
           let frames = 0;
           let lastFpsUpdate = performance.now();
@@ -228,8 +231,7 @@
             }
             frames++;
             if (t - lastFpsUpdate >= 1000) {
-              const lod = `Tiles ${renderer.visible_tile_count()} (L${renderer.finest_visible_level()}), cached ${renderer.cached_tile_count()}`;
-              status.textContent = `${base()} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())} — ${lod}`;
+              status.textContent = `${base()} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())} — ${tileStats(renderer)}`;
               frames = 0;
               lastFpsUpdate = t;
             }
