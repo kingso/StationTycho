@@ -76,10 +76,20 @@ Absolute positions (~1.7e6 m) in `f32` resolve only to about 0.2 m, which causes
 - **Vertex shader:** blend the corner offsets bilinearly (or use a small local cube-to-sphere evaluation relative to `T`), add `normal * h * exaggeration`, add `tile_origin_rel`, then multiply by the view-projection matrix.
 - The view matrix contains **rotation only** (the camera sits at the origin).
 
+**Current implementation:** the CPU computes every grid vertex in f64 and stores it as an f32 offset from the tile centre (12 bytes per vertex). The vertex shader adds `normal * h` (normal from the f32 tile centre plus offset, which is precise enough for a direction) and `tile_origin_rel`. There is no exaggeration control yet.
+
 ### 3.4 Shared grid mesh
 - One static 65×65 vertex grid plus a **skirt** ring (pushed inward along the normal by a per-level depth) to hide cracks between LOD levels.
 - Index buffer for triangles, and a separate line-list index buffer for wireframe. WebGPU has no polygon-mode line.
-- The terrain pipeline has a slope-scaled depth bias (pushing the surface back) so wireframe lines on its edges stay visible at grazing angles. Once heights are applied, the wireframe shader must displace vertices exactly like the terrain shader, or the lines end up buried under the surface.
+- While the wireframe is shown, the terrain is drawn with a slope-scaled depth bias (pushing the surface back) so lines on its edges stay visible at grazing angles. Normal rendering has no bias: on near-vertical skirts the bias can exceed the depth itself and leave pinholes.
+
+**Current implementation** (`crate/src/geometry.rs`, `crate/src/shaders/terrain.wgsl`):
+- 64×64 cells per tile, so vertex `(i, j)` sits exactly on DEM texel `(4i, 4j)`: heights are read with `textureLoad` (no filtering), and same-level neighbours share identical edge heights through the shared border texel.
+- Shared by all tiles: triangle and line indices, and a second vertex buffer of `[u, v, skirt]`. Each tile owns only its 4,481 offsets (4,225 grid + 256 skirt), 53.8 KB.
+- Skirt ring: copies of the edge vertices, lowered by a per-tile depth = drawn error of the tile + drawn error of its coarsest edge neighbour (found per frame, including across cube faces). Two meshes differ from the true terrain by at most their drawn errors, so this closes any step between neighbours.
+- The terrain and tile-wireframe entry points share one `displaced()` function, so the wireframe follows the terrain exactly.
+- DEM scale and offset come from the manifest.
+- Debug keys: W wireframe, H heights, C magenta background (any magenta inside the terrain is a crack), K skirts off.
 
 ### 3.5 LOD selection
 - Screen-space error: $\rho = \dfrac{\epsilon_{\text{level}} \cdot H_{\text{px}}}{2\,d\,\tan(\text{fov}/2)}$. Split when $\rho > \tau$ (for example 2 px).
@@ -88,9 +98,9 @@ Absolute positions (~1.7e6 m) in `f32` resolve only to about 0.2 m, which causes
 - Keep a parent visible until all 4 children have loaded, so the terrain never shows holes.
 
 **Current implementation** (`crate/src/lod.rs`):
-- Tiles are 8×8-cell grids sharing one index buffer; each tile mesh is only its vertices, as offsets from its f64 centre.
+- Tiles are drawn as 64×64-cell grids (§3.4), so a level-L tile has the vertex spacing of level L−2's full grid: its drawn error is `geometricError[L−2]`, doubling per level above level 0.
 - Bounds: per-tile angular radius from its corners and edge midpoints, widened by the maximum terrain height (10.8 km) for both the frustum sphere and the horizon test.
-- $\epsilon$ = max(terrain `geometricError` per level, read from the manifest; sag of the tile's flat grid cells). Split threshold 2 px, deepest level = the manifest's last level (7 in v2).
+- $\epsilon$ = max(drawn terrain error, from the manifest's `geometricError`; sag of the tile's flat grid cells). Split threshold 2 px, deepest level = the manifest's last level (7 in v2).
 - Priority refinement: always split the tile with the largest screen-space error; stop at the first split that would exceed the 1,024-tile budget, so a tight budget goes to the nearest terrain.
 - Readiness = the tile's DEM and albedo are resident on the GPU (§6). Pending children are returned as requests (most urgent first). A tile with a visible child that is unavailable (not in the manifest, 404, or failed for good) never splits, so refinement stops where the data does: level 3 away from Tycho, level 7 around it.
 
@@ -177,7 +187,7 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 - The page fetches `v2/meta/manifest.json` first; it supplies tile availability and per-level geometric error. Nothing is drawn until it loads.
 - At most 4 tiles (8 requests: albedo + DEM) in flight, started in the selector's priority order. Each frame, loads the selection no longer requests are aborted; late results of aborted or superseded requests are ignored.
 - 404 or wrong size: unavailable for the session. Network/server error: retry after 1 s, then 2 s, then unavailable.
-- GPU budget 256 MiB ÷ 398,886 bytes per tile (257² RGBA8 albedo + 257² `u16` DEM + 81 vertices) = 672 slots. Each slot owns its textures, vertex buffer and bind group, and is reused after eviction, so GPU memory never exceeds the budget.
+- GPU budget 256 MiB ÷ 450,066 bytes per tile (257² RGBA8 albedo + 257² `u16` DEM + 4,481 12-byte vertex offsets) = 596 slots. Each slot owns its textures, vertex buffer and bind group, and is reused after eviction, so GPU memory never exceeds the budget.
 - A load starts only if a slot will be free when it arrives (unused, or evictable). Least recently used tiles are evicted on demand; face roots and this frame's visible tiles and their ancestors never are. Data that arrives after its room has gone is dropped and re-requested later.
 - Each tile is textured from its own albedo and DEM; uv addresses the tile's texture, so `uv_scale_offset` is not needed while only ready tiles are drawn.
 
@@ -226,7 +236,7 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 | 9 | `feature/m4-terrain-displacement` | Tile-relative displacement from DEM heights, edge skirts, overlap-aware tile edges; the wireframe shader shares the same displacement so it stays usable for crack checks | 8 | Tycho's rim and central peak visible, no cracks between LOD levels |
 | 10 | `feature/m4.5-lighting` | Lommel-Seeliger shading with Lambert blend, sun controls, albedo texturing | 9 | Terminator and lit terrain look correct, sun direction responds to controls |
 | 11 | `feature/m4.5-shadows` | Horizon maps (offline pipeline addition plus shader) or a shadow map | 10, 5 | Terminator crossing Tycho shows relief shadows |
-| 12 | `feature/m5-picking-hud` | CPU-side height data, ray picking, lat/lon/altitude readout, streaming stats | 9 | Clicking Tycho's centre reads about 43.3°S, 11.2°W |
+| 12 | `feature/m5-picking-hud` | CPU-side height data, ray picking, lat/lon/altitude readout, streaming stats; keep the orbit target and camera above the terrain (the target is on the reference sphere, so over high ground a low camera can end up underground) | 9 | Clicking Tycho's centre reads about 43.3°S, 11.2°W |
 
 ```mermaid
 graph LR
