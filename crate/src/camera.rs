@@ -10,7 +10,7 @@ const MIN_ELEVATION: f64 = 2.0 * PI / 180.0;
 const MAX_LATITUDE: f64 = 89.5 * PI / 180.0;
 const ROTATE_RADIANS_PER_PX: f64 = 0.005;
 
-/// Orbit camera around a target point on the reference sphere, stored in f64.
+/// Orbit camera around a target point on the terrain, stored in f64.
 pub struct OrbitCamera {
     /// Target latitude in radians.
     pub lat: f64,
@@ -24,6 +24,10 @@ pub struct OrbitCamera {
     pub elevation: f64,
     /// Vertical field of view in radians.
     pub fov_y: f64,
+    /// Terrain height at the target above the reference sphere, in metres.
+    pub target_height: f64,
+    /// Terrain height under the camera above the reference sphere, in metres.
+    pub ground_height: f64,
 }
 
 impl OrbitCamera {
@@ -35,6 +39,8 @@ impl OrbitCamera {
             azimuth: 0.0,
             elevation: FRAC_PI_2,
             fov_y: 60f64.to_radians(),
+            target_height: 0.0,
+            ground_height: 0.0,
         }
     }
 
@@ -54,7 +60,7 @@ impl OrbitCamera {
     }
 
     pub fn target(&self) -> DVec3 {
-        latlon_to_unit(self.lat, self.lon) * MOON_RADIUS
+        latlon_to_unit(self.lat, self.lon) * (MOON_RADIUS + self.target_height)
     }
 
     pub fn position(&self) -> DVec3 {
@@ -68,8 +74,32 @@ impl OrbitCamera {
         (right, right.cross(forward), forward)
     }
 
+    /// Height of the camera above the terrain under it.
     pub fn altitude(&self) -> f64 {
-        self.position().length() - MOON_RADIUS
+        self.position().length() - MOON_RADIUS - self.ground_height
+    }
+
+    /// Unit direction of the ray from the camera through normalized device coordinates `(ndc_x, ndc_y)`
+    /// (-1..1, y up).
+    pub fn ray(&self, ndc_x: f64, ndc_y: f64, aspect: f64) -> DVec3 {
+        let (right, up, forward) = self.view_basis();
+        let tan_y = (self.fov_y * 0.5).tan();
+        (forward + right * (ndc_x * tan_y * aspect) + up * (ndc_y * tan_y)).normalize()
+    }
+
+    /// Tilts the camera up around its target until it is at least `clearance` metres above the terrain given by
+    /// `height_at` (metres above the reference sphere, for a unit direction). Straight above the target it is
+    /// `distance` above the ground there, so this always ends.
+    pub fn lift_above_terrain(&mut self, height_at: impl Fn(DVec3) -> f64, clearance: f64) {
+        const STEP: f64 = 0.5 * PI / 180.0;
+        for _ in 0..360 {
+            let position = self.position();
+            let ground = MOON_RADIUS + height_at(position.normalize());
+            if position.length() - ground >= clearance || self.elevation >= FRAC_PI_2 {
+                return;
+            }
+            self.elevation = (self.elevation + STEP).min(FRAC_PI_2);
+        }
     }
 
     /// View-projection with a rotation-only view; geometry must be supplied relative to `position()`.
@@ -153,6 +183,46 @@ mod tests {
             let error_px = (gpu.truncate() - reference.truncate()).length() * HEIGHT_PX * 0.5;
             assert!(error_px < 0.01, "step {step}: {error_px} px");
         }
+    }
+
+    #[test]
+    fn rays_match_the_projection() {
+        let mut cam = OrbitCamera::new(-43.31, -11.36, 5000.0);
+        cam.elevation = 0.6;
+        cam.azimuth = 1.1;
+        let aspect = 16.0 / 9.0;
+        assert!((cam.ray(0.0, 0.0, aspect) - cam.forward()).length() < 1e-12);
+        for (x, y) in [(0.5, -0.25), (-0.9, 0.8), (1.0, 1.0)] {
+            let point = cam.ray(x, y, aspect) * 1234.0;
+            let projected = ndc(cam.view_proj_f64(aspect) * point.extend(1.0));
+            assert!((projected.x - x).abs() < 1e-9 && (projected.y - y).abs() < 1e-9, "{x} {y}: {projected}");
+        }
+    }
+
+    #[test]
+    fn target_sits_on_the_terrain_and_altitude_is_above_the_ground() {
+        let mut cam = OrbitCamera::new(10.0, 20.0, 1000.0);
+        cam.target_height = -3000.0;
+        cam.ground_height = -3000.0;
+        assert!((cam.target().length() - (MOON_RADIUS - 3000.0)).abs() < 1e-6);
+        assert!((cam.altitude() - 1000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lifting_clears_a_hill_in_front() {
+        let mut cam = OrbitCamera::new(0.0, 0.0, 20_000.0);
+        cam.elevation = 5f64.to_radians();
+        // A 3 km plateau everywhere except right at the target.
+        let target_dir = cam.target().normalize();
+        let hill = |dir: DVec3| if dir.angle_between(target_dir) > 1e-3 { 3000.0 } else { 0.0 };
+        assert!(cam.position().length() - MOON_RADIUS < 3000.0);
+        cam.lift_above_terrain(hill, 10.0);
+        assert!(cam.position().length() - MOON_RADIUS - 3000.0 >= 10.0);
+        assert!(cam.elevation < FRAC_PI_2);
+        // Already clear: nothing changes.
+        let elevation = cam.elevation;
+        cam.lift_above_terrain(hill, 10.0);
+        assert_eq!(cam.elevation, elevation);
     }
 
     #[test]

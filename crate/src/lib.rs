@@ -7,6 +7,7 @@ mod manifest;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
 mod streaming;
+mod terrain;
 mod tiles;
 
 use wasm_bindgen::prelude::*;
