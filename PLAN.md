@@ -241,7 +241,7 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 | 7 | `feature/m4-quadtree-lod` ✅ | Quadtree, screen-space-error selection, frustum and horizon culling, parent-until-children-ready rule | 4 | Tiles split and merge smoothly while zooming, no holes, using placeholder heights |
 | 8 | `feature/m4-tile-streaming` ✅ | Fetcher with limited concurrency, `AbortController` cancellation, LRU cache with GPU memory budget | 5, 6, 7 | Panning/zooming keeps requests within the limit, cancelled tiles stop loading, memory stays under budget |
 | 9 | `feature/m4-terrain-displacement` ✅ | Tile-relative displacement from DEM heights, edge skirts, overlap-aware tile edges; the wireframe shader shares the same displacement so it stays usable for crack checks | 8 | Tycho's rim and central peak visible, no cracks between LOD levels |
-| 10 | `feature/m4.5-lighting` | Lommel-Seeliger shading with Lambert blend, sun controls, albedo texturing | 9 | Terminator and lit terrain look correct, sun direction responds to controls |
+| 10 | `feature/m4.5-lighting` ✅ | Lommel-Seeliger shading with Lambert blend, sun controls, albedo texturing | 9 | Terminator and lit terrain look correct, sun direction responds to controls |
 | 11 | `feature/m4.5-shadows` | Horizon maps (offline pipeline addition plus shader) or a shadow map | 10, 5 | Terminator crossing Tycho shows relief shadows |
 | 12 | `feature/m5-picking-hud` | CPU-side height data, ray picking, lat/lon/altitude readout, streaming stats; keep the orbit target and camera above the terrain (the target is on the reference sphere, so over high ground a low camera can end up underground) | 9 | Clicking Tycho's centre reads about 43.3°S, 11.2°W |
 
