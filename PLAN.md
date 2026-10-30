@@ -1,6 +1,6 @@
 # Station Tycho: WebGPU Engine & 3D Lunar Map Plan
 
-**Target:** `uat.kings.fyi` — Cloudflare Workers + R2 (`lunar-assets`)
+**Target:** production `tycho.kings.fyi` (deployed from `main`), UAT `uat.kings.fyi` (deployed from `dev`) — Cloudflare Workers + R2 (`lunar-assets`)
 **Stack:** Rust (`wasm32-unknown-unknown`), `wgpu` 30 (`webgpu` + `wgsl` features), `glam`, `web-sys`, TypeScript Worker, WGSL
 
 ---
@@ -202,6 +202,22 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 - A load starts only if a slot will be free when it arrives (unused, or evictable). Least recently used tiles are evicted on demand; face roots and this frame's visible tiles and their ancestors never are. Data that arrives after its room has gone is dropped and re-requested later.
 - Each tile is textured from its own albedo and DEM; uv addresses the tile's texture, so `uv_scale_offset` is not needed while only ready tiles are drawn.
 
+### 6.1 Information layer (M6, planned)
+- **Named features:** the IAU/USGS Gazetteer of Planetary Nomenclature, a US Government Work (public domain), regenerated nightly. Moon download: `https://asc-planetarynames-data.s3.us-west-2.amazonaws.com/MOON_nomenclature_center_pts.zip` (shapefile; the `.dbf` holds the attributes).
+  - 9,087 features: 1,615 named craters; 7,064 "satellite features" (lettered craters such as Tycho A); rilles, montes, maria, dorsa, lacus, catenae, valles, sinus, promontoria; 81 astronaut-named features.
+  - Fields used: `name`, `type`, `diameter` (km), `center_lat`, `center_lon` (planetocentric, **east longitude 0–360**), `origin` (who or what it is named after), `approval`, `link` (Gazetteer page).
+  - Example: Tycho = 43.30°S, 348.78°E (11.22°W), 85.3 km, "Tycho Brahe; Danish astronomer (1546-1601)".
+- **Sites and points of interest:** a curated `tools/pipeline/sites.json` (landing sites and other points), every entry citing its coordinate source (e.g. LROC-measured lander positions). Not in the Gazetteer.
+- **Pipeline:** `npm run assets:features` converts both into one compact, versioned JSON file (`features/v1.json`, about 1 MB, about 250 KB gzipped) and uploads it. It keeps the fields above and longitudes in [-180, 180).
+- **Rendering:** a 2D-canvas overlay drawn by the page.
+  - Each frame, the engine projects candidate features to the screen in one batch.
+  - It hides those behind the horizon or behind terrain, by casting the picking ray from the camera towards each feature against the drawn heights.
+  - A label shows when its feature is large enough on screen (e.g. projected diameter ≥ 40 px, so larger features appear first), placed greedily by priority without overlaps. Satellite features only appear when zoomed in close.
+- **Interaction:**
+  - Clicking a label (or picking near a feature) opens an info panel: name, type, diameter, origin, approval, Gazetteer link.
+  - Search with fly-to, which sets the orbit target and a distance that frames the feature.
+  - Layer toggles: craters, other features, sites.
+
 ---
 
 ## 7. Roadmap
@@ -215,10 +231,12 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 | **M4: Quadtree terrain** ✅ | SSE + horizon culling, skirts, tile-relative displacement, LRU cache, prioritized fetching | Tycho rim and central peak visible; no cracks or holes while zooming |
 | **M4.5: Lighting** | Lommel-Seeliger shading, sun controls, horizon-map shadows | Terminator crossing Tycho shows correct relief shadows |
 | **M5: HUD & telemetry** ✅ | CPU-side picking, lat/lon/altitude readout, streaming stats (in-flight, cached, GPU MB) | Clicking Tycho's centre reads about 43.3°S, 11.2°W |
+| **M6: Information layer** | Gazetteer feature labels (craters, montes, maria, rilles…), landing sites and points of interest, decluttered labels hidden by horizon and terrain, info panel, search with fly-to (§6.1) | From orbit, major maria and large craters are labelled without overlaps; zooming in on Tycho reveals smaller named features. Clicking Tycho's label shows 85.3 km and "Tycho Brahe"; searching "Copernicus" flies there |
 
 ---
 
 ## 8. Open Decisions
+- **Decided:** terrain shadows use horizon maps baked offline, not a runtime shadow map: static terrain under a moving sun, long low-sun shadows, almost no runtime cost. Deferred until the next data rebuild (`v3`). Bundle with it a one-texel border ring for exact normals at tile edges and, if available, polar albedo. A shadow map can be added later for 3D objects.
 - KTX2 transcoder choice (`basis_universal` via C++ → WASM vs. a pure-Rust alternative) and when to adopt it.
 - Whether to support adapters without WebGPU at all (WebGL2 backend in wgpu) or show an unsupported message only.
 - Hosting R2 tiles on a custom domain instead of serving them through the Worker.
@@ -246,9 +264,13 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 | 8 | `feature/m4-tile-streaming` ✅ | Fetcher with limited concurrency, `AbortController` cancellation, LRU cache with GPU memory budget | 5, 6, 7 | Panning/zooming keeps requests within the limit, cancelled tiles stop loading, memory stays under budget |
 | 9 | `feature/m4-terrain-displacement` ✅ | Tile-relative displacement from DEM heights, edge skirts, overlap-aware tile edges; the wireframe shader shares the same displacement so it stays usable for crack checks | 8 | Tycho's rim and central peak visible, no cracks between LOD levels |
 | 10 | `feature/m4.5-lighting` ✅ | Lommel-Seeliger shading with Lambert blend, sun controls, albedo texturing | 9 | Terminator and lit terrain look correct, sun direction responds to controls |
-| 11 | `feature/m4.5-shadows` | Horizon maps (offline pipeline addition plus shader) or a shadow map | 10, 5 | Terminator crossing Tycho shows relief shadows |
+| 11 | `feature/m4.5-shadows` (deferred) | Horizon maps (decided, §8): bake per-texel horizon angles in the pipeline as a `v3` layer, sample them in the shader | 10, 5 | Terminator crossing Tycho shows relief shadows |
 | 12 | `feature/m5-picking-hud` ✅ | CPU-side height data, ray picking, lat/lon/altitude readout, streaming stats; keep the orbit target and camera above the terrain (the target is on the reference sphere, so over high ground a low camera can end up underground) | 9 | Clicking Tycho's centre reads about 43.3°S, 11.2°W |
 
+| 13 | `feature/m6-feature-data` | `npm run assets:features`: Gazetteer `.dbf` + curated `sites.json` → `features/v1.json`, validation, upload | none (parallel) | Output has all Gazetteer features with valid coordinates; Tycho matches the Gazetteer; upload works locally |
+| 14 | `feature/m6-labels` | Batch projection, horizon and terrain occlusion, priority and size thresholds, collision-free placement on a 2D overlay, layer toggles | 12, 13 | Labels stay readable without overlaps at every zoom; nothing behind the Moon or a ridge is labelled; 60 FPS |
+| 15 | `feature/m6-info-search` | Info panel on label click or pick, search with fly-to | 14 | Clicking Tycho shows its Gazetteer details; searching "Copernicus" flies there |
+| 16 | `feature/m6-sites` | Landing sites and points of interest with sources, own icons and layer | 14 | Apollo 11 marker sits at its LROC-measured position (within 100 m) |
 ```mermaid
 graph LR
   P1[1 phase1-foundation] --> C[3 m2-camera-depth] --> S[4 m2-sphere-wireframe]
@@ -259,6 +281,9 @@ graph LR
   T --> ST --> D[9 m4-terrain-displacement]
   D --> L[10 m4.5-lighting] --> SH[11 m4.5-shadows]
   D --> H[12 m5-picking-hud]
+  FD[13 m6-feature-data] --> LB[14 m6-labels]
+  H --> LB --> IS[15 m6-info-search]
+  LB --> SI[16 m6-sites]
 ```
 
 - Branches 2 and 5 touch different files from the engine (`src/index.ts` and `tools/`), so they can run at any time without conflicts.
@@ -266,7 +291,7 @@ graph LR
 
 ### 9.3 Rules
 - **Build gate:** `npm run build` and `npm run typecheck` must pass before merging into `dev`. `npm run test:engine` runs the camera and geometry tests on the host.
-- **Tags:** tag `dev` after each engine milestone: `m2-done` (after 4), `m3-done` (after 6), `m4-done` (after 9), `m4.5-done` (after 11), `m5-done` (after 12).
+- **Tags:** tag `dev` after each engine milestone: `m2-done` (after 4), `m3-done` (after 6), `m4-done` (after 9), `m4.5-done` (after 11), `m5-done` (after 12), `m6-done` (after 15 and 16).
 - **Tile format first:** test tiles used in branch 6 must already follow the 257×257, `u16` layout and `/v1/` key scheme in §4.2–4.3, so branch 6 doesn't change when branch 5 lands.
 - **Rebase:** rebase long-running branches (7 to 9) onto `dev` regularly.
 - **Dependencies:** keep `Cargo.lock` committed so wgpu and other crate versions are reproducible.
