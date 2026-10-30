@@ -3,6 +3,8 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use glam::{DMat4, DVec3, DVec4, Mat4};
 
 use crate::geometry::{enu_frame, latlon_to_unit, MOON_RADIUS};
+#[cfg(test)]
+use crate::geometry::{TYCHO_LAT_DEG, TYCHO_LON_DEG};
 
 const MIN_DISTANCE: f64 = 0.5;
 const MAX_DISTANCE: f64 = 10.0 * MOON_RADIUS;
@@ -166,7 +168,7 @@ mod tests {
     #[test]
     fn camera_relative_rendering_is_stable_at_one_metre() {
         const HEIGHT_PX: f64 = 2160.0;
-        let mut cam = OrbitCamera::new(-43.31, -11.36, 1.2);
+        let mut cam = OrbitCamera::new(TYCHO_LAT_DEG, TYCHO_LON_DEG, 1.2);
         cam.elevation = 0.9;
         let origin = cam.target();
         let (east, north, up) = enu_frame(cam.lat, cam.lon);
@@ -187,7 +189,7 @@ mod tests {
 
     #[test]
     fn rays_match_the_projection() {
-        let mut cam = OrbitCamera::new(-43.31, -11.36, 5000.0);
+        let mut cam = OrbitCamera::new(TYCHO_LAT_DEG, TYCHO_LON_DEG, 5000.0);
         cam.elevation = 0.6;
         cam.azimuth = 1.1;
         let aspect = 16.0 / 9.0;
@@ -236,7 +238,7 @@ mod tests {
 
     #[test]
     fn controls_respect_limits_and_reverse() {
-        let mut cam = OrbitCamera::new(-43.31, -11.36, 5000.0);
+        let mut cam = OrbitCamera::new(TYCHO_LAT_DEG, TYCHO_LON_DEG, 5000.0);
         let (lat, lon) = (cam.lat, cam.lon);
         cam.pan(120.0, -80.0, 1080.0);
         assert!(cam.lat != lat && cam.lon != lon);

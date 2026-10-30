@@ -5,6 +5,7 @@ use std::rc::Rc;
 use crate::camera::OrbitCamera;
 use crate::geometry::{
     enu_frame, grid_attributes, grid_indices, grid_vertex_count, texel_spacing, tile_vertices, Face, MOON_RADIUS,
+    TYCHO_LAT_DEG, TYCHO_LON_DEG,
 };
 use crate::lighting::{sun_direction, wrap_longitude_deg, DEFAULT_SUBSOLAR_LON_DEG};
 use crate::lod::{select_tiles, skirt_depths, LodConfig, TileId, MAX_VISIBLE_TILES, TILE_SEGMENTS};
@@ -39,8 +40,6 @@ const DEBUG_CRACKS: u32 = 4;
 const ALBEDO_BYTES: usize = (TILE_SIZE * TILE_SIZE * 4) as usize;
 const DEM_BYTES: usize = (TILE_SIZE * TILE_SIZE * 2) as usize;
 
-const TYCHO_LAT_DEG: f64 = -43.31;
-const TYCHO_LON_DEG: f64 = -11.36;
 
 fn face_color(face: Face) -> [f32; 4] {
     match face {

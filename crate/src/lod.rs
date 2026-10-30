@@ -396,7 +396,7 @@ mod tests {
 
     const ASPECT: f64 = 16.0 / 9.0;
     const HEIGHT_PX: u32 = 1080;
-    const TYCHO: (f64, f64) = (-43.31, -11.36);
+    const TYCHO: (f64, f64) = (crate::geometry::TYCHO_LAT_DEG, crate::geometry::TYCHO_LON_DEG);
     /// Camera distances to the target matching the HUD altitudes seen while zooming, from the start view down.
     const DISTANCES: [f64; 5] = [3.0 * MOON_RADIUS, 601_100.0, 69_300.0, 7_995.0, 1_000.0];
     const ELEVATIONS_DEG: [f64; 3] = [90.0, 30.0, 5.0];
