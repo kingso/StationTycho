@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::camera::OrbitCamera;
-use crate::geometry::{enu_frame, grid_attributes, grid_indices, grid_vertex_count, tile_vertices, Face, MOON_RADIUS};
+use crate::geometry::{
+    enu_frame, grid_attributes, grid_indices, grid_vertex_count, texel_spacing, tile_vertices, Face, MOON_RADIUS,
+};
+use crate::lighting::{sun_direction, wrap_longitude_deg, DEFAULT_SUBSOLAR_LON_DEG};
 use crate::lod::{select_tiles, skirt_depths, LodConfig, TileId, MAX_VISIBLE_TILES, TILE_SEGMENTS};
 use crate::manifest::{DemQuantization, Manifest};
 use crate::streaming::{
@@ -21,8 +24,8 @@ const TERRAIN_SHADER: &str = include_str!("shaders/terrain.wgsl");
 const WIREFRAME_SHADER: &str = include_str!("shaders/wireframe.wgsl");
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const FRAME_UNIFORM_SIZE: u64 = 80;
-const OBJECT_UNIFORM_SIZE: u64 = 48;
+const FRAME_UNIFORM_SIZE: u64 = 96;
+const OBJECT_UNIFORM_SIZE: u64 = 80;
 /// Marker vertices: `[offset.xyz, normal.xyz, uv.xy]`.
 const MARKER_VERTEX_STRIDE: u64 = 32;
 /// Tile vertices: an f32 offset from the tile centre (buffer 0), plus shared `[u, v, skirt]` (buffer 1).
@@ -121,6 +124,9 @@ struct TileSlot {
     bind_group: wgpu::BindGroup,
     /// Centre of the tile now in the slot; its vertices are offsets from it.
     origin: DVec3,
+    /// The face's u and v axes with the metres per DEM texel along them, for terrain normals.
+    u_axis: [f32; 4],
+    v_axis: [f32; 4],
 }
 
 impl TileSlot {
@@ -148,7 +154,7 @@ impl TileSlot {
                 },
             ],
         });
-        Self { albedo, dem, vertex_buffer, bind_group, origin: DVec3::ZERO }
+        Self { albedo, dem, vertex_buffer, bind_group, origin: DVec3::ZERO, u_axis: [0.0; 4], v_axis: [0.0; 4] }
     }
 
     fn upload(&mut self, queue: &wgpu::Queue, tile: TileId, albedo: &[u8], dem: &[u8]) {
@@ -158,6 +164,10 @@ impl TileSlot {
         write_tile(queue, &self.dem, dem, 2);
         queue.write_buffer(&self.vertex_buffer, 0, &f32_bytes(&vertices));
         self.origin = origin;
+        let (_, u_axis, v_axis) = tile.face.axes();
+        let (du, dv) = texel_spacing(tile.face, tile.level, tile.x, tile.y).expect("cached tiles are inside the quadtree");
+        self.u_axis = u_axis.as_vec3().extend(du as f32).to_array();
+        self.v_axis = v_axis.as_vec3().extend(dv as f32).to_array();
     }
 }
 
@@ -201,13 +211,17 @@ fn tycho_marker(device: &wgpu::Device) -> Mesh {
     Mesh::new(device, "Tycho Marker", up * MOON_RADIUS, &vertices, &indices, [1.0, 0.45, 0.2, 1.0])
 }
 
-/// Per-object uniform: origin relative to the camera with the skirt depth, the wireframe colour, then the origin
-/// itself (only used for directions).
-fn object_uniform(origin: DVec3, skirt_depth: f64, color: [f32; 4], camera_position: DVec3) -> Vec<u8> {
+/// Per-object uniform: origin relative to the camera with the skirt depth, the wireframe colour, the origin itself
+/// (only used for directions), then the face axes with their texel spacing (zero for non-terrain objects).
+fn object_uniform(origin: DVec3, skirt_depth: f64, color: [f32; 4], axes: ([f32; 4], [f32; 4]), camera_position: DVec3) -> Vec<u8> {
     let rel = (origin - camera_position).as_vec3();
     let center = origin.as_vec3();
-    let [r, g, b, a] = color;
-    f32_bytes(&[rel.x, rel.y, rel.z, skirt_depth as f32, r, g, b, a, center.x, center.y, center.z, 0.0])
+    let mut data = vec![rel.x, rel.y, rel.z, skirt_depth as f32];
+    data.extend_from_slice(&color);
+    data.extend_from_slice(&[center.x, center.y, center.z, 0.0]);
+    data.extend_from_slice(&axes.0);
+    data.extend_from_slice(&axes.1);
+    f32_bytes(&data)
 }
 
 fn create_tile_texture(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat) -> wgpu::Texture {
@@ -348,6 +362,9 @@ pub struct Renderer {
     frame_index: u64,
     debug_flags: u32,
     camera: OrbitCamera,
+    sun_lon_deg: f64,
+    /// sRGB view of the surface texture, so linear shader output is encoded for display.
+    view_format: wgpu::TextureFormat,
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
 }
@@ -394,6 +411,18 @@ impl Renderer {
     /// so cracks stand out; bit 3 turns skirts off.
     pub fn set_debug_flags(&mut self, flags: u32) {
         self.debug_flags = flags;
+    }
+
+    /// Longitude of the sub-solar point in degrees (east positive).
+    pub fn sun_longitude(&self) -> f64 {
+        self.sun_lon_deg
+    }
+
+    /// Moves the sun to sub-solar longitude `lon_deg`, wrapped to [-180, 180).
+    pub fn set_sun_longitude(&mut self, lon_deg: f64) {
+        if lon_deg.is_finite() {
+            self.sun_lon_deg = wrap_longitude_deg(lon_deg);
+        }
     }
 
     /// Number of quadtree tiles drawn in the last frame.
@@ -482,6 +511,8 @@ impl Renderer {
         let mut frame_data = f32_bytes(&view_proj.to_cols_array());
         frame_data.extend_from_slice(&u32_bytes(&[self.debug_flags]));
         frame_data.extend_from_slice(&f32_bytes(&[self.dem.scale as f32, self.dem.offset as f32, 0.0]));
+        let sun = sun_direction(self.sun_lon_deg).as_vec3();
+        frame_data.extend_from_slice(&f32_bytes(&[sun.x, sun.y, sun.z, 0.0]));
         self.queue.write_buffer(&self.frame_buffer, 0, &frame_data);
 
         // Visible tiles take the first uniform slots and the marker the last.
@@ -491,10 +522,10 @@ impl Renderer {
         let mut objects = vec![0u8; stride * (visible_count + 1)];
         for (i, (slot, skirt, color)) in drawn.iter().enumerate() {
             objects[i * stride..i * stride + OBJECT_UNIFORM_SIZE as usize]
-                .copy_from_slice(&object_uniform(slot.origin, *skirt, *color, camera_pos));
+                .copy_from_slice(&object_uniform(slot.origin, *skirt, *color, (slot.u_axis, slot.v_axis), camera_pos));
         }
         objects[visible_count * stride..visible_count * stride + OBJECT_UNIFORM_SIZE as usize]
-            .copy_from_slice(&object_uniform(self.marker.origin, 0.0, self.marker.color, camera_pos));
+            .copy_from_slice(&object_uniform(self.marker.origin, 0.0, self.marker.color, ([0.0; 4], [0.0; 4]), camera_pos));
         self.queue.write_buffer(&self.object_buffer, 0, &objects);
 
         let frame = match self.surface.get_current_texture() {
@@ -506,7 +537,10 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
             other => return Err(JsValue::from_str(&format!("Surface error: {:?}", other))),
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.view_format),
+            ..Default::default()
+        });
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
@@ -674,6 +708,8 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
     let height = height.clamp(1, max_dim);
     let caps = surface.get_capabilities(&adapter);
     let surface_format = caps.formats[0];
+    // Browsers prefer a non-sRGB canvas (bgra8unorm); render through its sRGB view so shading stays linear.
+    let view_format = surface_format.add_srgb_suffix();
 
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -682,7 +718,7 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         height,
         present_mode: wgpu::PresentMode::AutoVsync,
         alpha_mode: caps.alpha_modes[0],
-        view_formats: vec![],
+        view_formats: if view_format == surface_format { vec![] } else { vec![view_format] },
         desired_maximum_frame_latency: 2,
         color_space: Default::default(),
     };
@@ -828,7 +864,7 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
             (&terrain_shader, "vs_main", "fs_main"),
             &tile_buffers,
             &terrain_layout,
-            surface_format,
+            view_format,
             wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
             bias,
         )
@@ -841,7 +877,7 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         (&terrain_shader, "vs_wire", "fs_wire"),
         &tile_buffers,
         &terrain_layout,
-        surface_format,
+        view_format,
         line_list,
         wgpu::DepthBiasState::default(),
     );
@@ -851,7 +887,7 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         (&line_shader, "vs_main", "fs_main"),
         &marker_buffers,
         &pipeline_layout,
-        surface_format,
+        view_format,
         line_list,
         wgpu::DepthBiasState::default(),
     );
@@ -886,6 +922,8 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         frame_index: 0,
         debug_flags: 0,
         camera: OrbitCamera::new(TYCHO_LAT_DEG, TYCHO_LON_DEG, 3.0 * MOON_RADIUS),
+        sun_lon_deg: DEFAULT_SUBSOLAR_LON_DEG,
+        view_format,
         _depth_texture: depth_texture,
         depth_view,
     })
