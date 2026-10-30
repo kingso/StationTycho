@@ -123,21 +123,33 @@
       const DEBUG_HEIGHT = 2;
       const DEBUG_CRACKS = 4;
       const DEBUG_NO_SKIRTS = 8;
+      const DEBUG_UNLIT = 16;
 
       function tileStats(renderer) {
         const resident = `${renderer.resident_tile_count()}/${renderer.tile_capacity()} (${renderer.tile_gpu_megabytes().toFixed(0)} MB)`;
         return `Tiles ${renderer.visible_tile_count()} (L${renderer.finest_visible_level()}), resident ${resident}, loading ${renderer.loading_tile_count()}, cancelled ${renderer.cancelled_tile_count()}, failed ${renderer.failed_tile_count()}`;
       }
 
-      // W toggles the wireframe, H the height view, C a magenta background that shows cracks, K the skirts.
+      // W toggles the wireframe, H the height view, C a magenta background that shows cracks, K the skirts,
+      // L the lighting. [ and ] move the sun 5° west or east (1° with Shift).
       function attachDebugKeys(renderer) {
         let flags = 0;
         window.addEventListener("keydown", (e) => {
-          const bit = { w: DEBUG_WIREFRAME, h: DEBUG_HEIGHT, c: DEBUG_CRACKS, k: DEBUG_NO_SKIRTS }[e.key.toLowerCase()];
-          if (!bit || e.ctrlKey || e.metaKey || e.altKey) return;
+          if (e.ctrlKey || e.metaKey || e.altKey) return;
+          const sunStep = { "[": -5, "]": 5, "{": -1, "}": 1 }[e.key];
+          if (sunStep) {
+            renderer.set_sun_longitude(renderer.sun_longitude() + (e.shiftKey ? Math.sign(sunStep) : sunStep));
+            return;
+          }
+          const bit = { w: DEBUG_WIREFRAME, h: DEBUG_HEIGHT, c: DEBUG_CRACKS, k: DEBUG_NO_SKIRTS, l: DEBUG_UNLIT }[e.key.toLowerCase()];
+          if (!bit) return;
           flags ^= bit;
           renderer.set_debug_flags(flags);
         });
+      }
+
+      function formatLongitude(deg) {
+        return `${Math.abs(deg).toFixed(0)}°${deg < 0 ? "W" : "E"}`;
       }
 
       // Left drag pans, right or Shift drag rotates/tilts, wheel or pinch zooms.
@@ -233,7 +245,7 @@
             }
             frames++;
             if (t - lastFpsUpdate >= 1000) {
-              status.textContent = `${base()} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())} — ${tileStats(renderer)}`;
+              status.textContent = `${base()} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())} — Sun ${formatLongitude(renderer.sun_longitude())} — ${tileStats(renderer)}`;
               frames = 0;
               lastFpsUpdate = t;
             }

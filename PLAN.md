@@ -171,6 +171,13 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 - No atmosphere: black sky, hard terminator.
 - **Shadows** (crater rims, central peaks) need a separate technique: per-tile horizon maps (precomputed offline) or a cascaded shadow map. Vertex displacement alone only gives shading, not cast shadows.
 
+**Current implementation** (`crate/src/shaders/terrain.wgsl`, `crate/src/lighting.rs`):
+- Per-pixel terrain normals from the full-resolution DEM: central-difference slopes at the four nearest texels, blended bilinearly, scaled by each tile's metres per texel and applied along the face's u/v axes projected onto the local horizontal. Shading therefore has 4× the detail of the 64×64 mesh.
+- McEwen's lunar-Lambert function, $2L\mu_0/(\mu_0+\mu) + (1-L)\mu_0$, with $L(\alpha) = 1 - 0.019\alpha + 2.42{\cdot}10^{-4}\alpha^2 - 1.46{\cdot}10^{-6}\alpha^3$ (α = phase in degrees). The result is divided by its value at the albedo mosaic's reference geometry (incidence 30°, emission 0°, phase 30°), so a texel shows as stored under standard lighting.
+- No ambient light. A pixel is black if its terrain normal faces away from the sun, or if the sun is more than 3.5° below the reference horizon (the most a 10.8 km peak can still see).
+- The sun's sub-solar latitude is fixed at 0 (it stays within ±1.6°). The default sub-solar longitude of 80°W puts the sun 15° above Tycho, with the terminator about 470 km to its east. `[`/`]` move it 5° (1° with Shift); L shows the unlit albedo.
+- The canvas's preferred format is not sRGB (`bgra8unorm`), so the renderer draws through an sRGB view of it. Before this, linear values were written straight to the canvas and the albedo looked darker than its data.
+
 ### 5.4 Camera & input
 - Orbit camera stored in f64 (target, distance, azimuth, elevation). Mouse and touch drag, wheel zoom (scaled logarithmically with altitude).
 - Near plane scales with altitude; far plane is infinite (reversed-Z).

@@ -1,5 +1,6 @@
 mod camera;
 mod geometry;
+mod lighting;
 mod lod;
 mod manifest;
 // Canvas surfaces only exist on wasm32; gating lets `cargo test` build on the host.

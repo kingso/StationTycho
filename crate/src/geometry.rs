@@ -52,7 +52,7 @@ impl Face {
     }
 
     /// Outward normal and the face's `u` and `v` axes, with `u × v = normal`.
-    fn axes(self) -> (DVec3, DVec3, DVec3) {
+    pub fn axes(self) -> (DVec3, DVec3, DVec3) {
         match self {
             Face::Px => (DVec3::X, DVec3::Y, DVec3::Z),
             Face::Nx => (DVec3::NEG_X, DVec3::NEG_Y, DVec3::Z),
@@ -126,6 +126,23 @@ pub fn tile_face_bounds(level: u8, x: u32, y: u32) -> Option<(f64, f64, f64, f64
     let step = 2.0 / side as f64;
     let (u0, v0) = (-1.0 + x as f64 * step, -1.0 + y as f64 * step);
     Some((u0, u0 + step, v0, v0 + step))
+}
+
+/// Ground distance in metres per DEM texel along the tile's `u` and `v` directions, measured along its centre
+/// lines on the reference sphere (a 257-texel tile spans 256 texel steps).
+pub fn texel_spacing(face: Face, level: u8, x: u32, y: u32) -> Option<(f64, f64)> {
+    let (u0, u1, v0, v1) = tile_face_bounds(level, x, y)?;
+    let (um, vm) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+    let arc = |from: (f64, f64), to: (f64, f64)| {
+        const STEPS: usize = 16;
+        let point = |k: usize| {
+            let t = k as f64 / STEPS as f64;
+            cube_to_unit(face, from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
+        };
+        (0..STEPS).map(|k| point(k).angle_between(point(k + 1))).sum::<f64>() * MOON_RADIUS
+    };
+    let last_texel = f64::from(crate::tiles::TILE_SIZE - 1);
+    Some((arc((u0, vm), (u1, vm)) / last_texel, arc((um, v0), (um, v1)) / last_texel))
 }
 
 /// Number of vertices in a tile grid: `(segments + 1)²` grid vertices, then a skirt ring of `4 · segments`.
@@ -318,6 +335,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn texel_spacing_matches_tile_size() {
+        // A face spans a quarter of a great circle; its centre lines are exactly that long.
+        let quarter = std::f64::consts::FRAC_PI_2 * MOON_RADIUS / 256.0;
+        let (a, b) = texel_spacing(Face::Pz, 0, 0, 0).unwrap();
+        assert!((a - quarter).abs() < 1.0 && (b - quarter).abs() < 1.0, "{a} {b}");
+        // Level 7 tiles near Tycho: about 2729 km / 128 / 256 ≈ 83 m, within the mapping's ±25 % stretch.
+        let (a, b) = texel_spacing(Face::Px, 7, 42, 0).unwrap();
+        assert!((60.0..110.0).contains(&a) && (60.0..110.0).contains(&b), "{a} {b}");
+        // Halving per level.
+        let (parent, child) = (texel_spacing(Face::Ny, 3, 2, 5).unwrap(), texel_spacing(Face::Ny, 4, 5, 11).unwrap());
+        assert!((child.0 / parent.0 - 0.5).abs() < 0.05 && (child.1 / parent.1 - 0.5).abs() < 0.05);
+        assert!(texel_spacing(Face::Px, 1, 2, 0).is_none());
     }
 
     #[test]
