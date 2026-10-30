@@ -67,7 +67,8 @@
         text-transform: uppercase;
       }
 
-      #status {
+      #status,
+      #location {
         margin: 0;
         color: var(--muted);
         font-size: 0.85rem;
@@ -84,6 +85,7 @@
       <div id="hud">
         <h1>Station Tycho</h1>
         <p id="status">Booting lunar engine&hellip;</p>
+        <p id="location"></p>
       </div>
     </main>
 
@@ -95,6 +97,7 @@
       } from "./pkg/station_tycho_engine.js";
 
       const status = document.getElementById("status");
+      const locationLine = document.getElementById("location");
       const canvas = document.getElementById("viewport");
 
       const UNSUPPORTED =
@@ -148,18 +151,27 @@
         });
       }
 
-      function formatLongitude(deg) {
-        return `${Math.abs(deg).toFixed(0)}°${deg < 0 ? "W" : "E"}`;
+      function formatLongitude(deg, digits = 0) {
+        return `${Math.abs(deg).toFixed(digits)}°${deg < 0 ? "W" : "E"}`;
       }
 
-      // Left drag pans, right or Shift drag rotates/tilts, wheel or pinch zooms.
-      function attachControls(renderer) {
+      function formatLocation([lat, lon, height]) {
+        const latitude = `${Math.abs(lat).toFixed(2)}°${lat < 0 ? "S" : "N"}`;
+        return `${latitude} ${formatLongitude(lon, 2)}, ${Math.round(height).toLocaleString("en-US")} m`;
+      }
+
+      // Left drag pans, right or Shift drag rotates/tilts, wheel or pinch zooms. A left click without dragging
+      // picks the terrain point under the cursor and passes it to `onPick` (undefined for sky).
+      function attachControls(renderer, onPick) {
+        const CLICK_SLOP_PX = 4;
         const pointers = new Map();
+        let press = null;
         const dpr = () => window.devicePixelRatio || 1;
         canvas.addEventListener("contextmenu", (e) => e.preventDefault());
         canvas.addEventListener("pointerdown", (e) => {
           canvas.setPointerCapture(e.pointerId);
           pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+          press = pointers.size === 1 && e.button === 0 ? { id: e.pointerId, x: e.clientX, y: e.clientY } : null;
         });
         canvas.addEventListener("pointermove", (e) => {
           const prev = pointers.get(e.pointerId);
@@ -180,7 +192,15 @@
           pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
         });
         const release = (e) => pointers.delete(e.pointerId);
-        canvas.addEventListener("pointerup", release);
+        canvas.addEventListener("pointerup", (e) => {
+          release(e);
+          if (press?.id !== e.pointerId) return;
+          if (Math.hypot(e.clientX - press.x, e.clientY - press.y) < CLICK_SLOP_PX) {
+            const rect = canvas.getBoundingClientRect();
+            onPick(renderer.pick((e.clientX - rect.left) * dpr(), (e.clientY - rect.top) * dpr()));
+          }
+          press = null;
+        });
         canvas.addEventListener("pointercancel", release);
         canvas.addEventListener(
           "wheel",
@@ -216,7 +236,14 @@
             return;
           }
           observeCanvasSize((w, h) => renderer.resize(w, h));
-          attachControls(renderer);
+          let picked = "click the terrain to pick a point";
+          const showLocation = () => {
+            locationLine.textContent = `Target ${formatLocation(renderer.target_location())} — Picked ${picked}`;
+          };
+          attachControls(renderer, (point) => {
+            picked = point ? formatLocation(point) : "sky";
+            showLocation();
+          });
           attachDebugKeys(renderer);
 
           let manifest = "loading";
@@ -246,6 +273,7 @@
             frames++;
             if (t - lastFpsUpdate >= 1000) {
               status.textContent = `${base()} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())} — Sun ${formatLongitude(renderer.sun_longitude())} — ${tileStats(renderer)}`;
+              showLocation();
               frames = 0;
               lastFpsUpdate = t;
             }

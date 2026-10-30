@@ -181,6 +181,7 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 ### 5.4 Camera & input
 - Orbit camera stored in f64 (target, distance, azimuth, elevation). Mouse and touch drag, wheel zoom (scaled logarithmically with altitude).
 - Near plane scales with altitude; far plane is infinite (reversed-Z).
+- **Current implementation:** the orbit target sits on the drawn terrain. Its height eases towards the terrain height under it (20 % per frame), so a tile refining to slightly different heights does not make the view jump. If the camera would be less than 1 m above the drawn terrain, it tilts up around the target until it clears; it never lowers the tilt again. Altitude in the HUD and for the near plane is height above the terrain under the camera.
 
 ---
 
@@ -189,6 +190,9 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 - **Fetching:** at most 6–8 requests in flight, priority = SSE × visibility, cancel requests that are no longer needed (`AbortController`).
 - **Errors:** a 404 or a failed decode marks the tile unavailable and keeps the parent visible.
 - **Picking:** keep downsampled height data on the CPU per loaded tile. Cast a ray from the camera against the sphere plus heights, convert the hit to lat/lon with `cube_to_latlon`.
+  - Current implementation (`crate/src/terrain.rs`): each GPU slot keeps the 65×65 `u16` heights its grid renders (8.4 KB, about 5 MB for all 596 slots). Heights are looked up in the drawn tiles only and interpolated over the mesh's own triangles, so picks land on exactly what is on screen.
+  - The ray starts where it enters the sphere of maximum terrain height (10.8 km). It steps by half its current height above the ground (no jumping through slopes up to about 63°), then bisects the crossing.
+  - A left click without dragging (under 4 px) picks. The HUD's second line shows the orbit target and the last picked point (latitude, longitude, height).
 
 **Current implementation** (`crate/src/manifest.rs`, `crate/src/streaming.rs`, `crate/src/renderer.rs`):
 - The page fetches `v2/meta/manifest.json` first; it supplies tile availability and per-level geometric error. Nothing is drawn until it loads.

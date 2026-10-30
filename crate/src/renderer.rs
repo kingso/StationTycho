@@ -9,6 +9,7 @@ use crate::geometry::{
 use crate::lighting::{sun_direction, wrap_longitude_deg, DEFAULT_SUBSOLAR_LON_DEG};
 use crate::lod::{select_tiles, skirt_depths, LodConfig, TileId, MAX_VISIBLE_TILES, TILE_SEGMENTS};
 use crate::manifest::{DemQuantization, Manifest};
+use crate::terrain::{grid_heights, ray_terrain, DrawnTerrain};
 use crate::streaming::{
     tile_gpu_bytes, Completion, FetchResult, TileCache, GPU_TILE_BUDGET_BYTES, MAX_IN_FLIGHT_TILES,
 };
@@ -127,6 +128,8 @@ struct TileSlot {
     /// The face's u and v axes with the metres per DEM texel along them, for terrain normals.
     u_axis: [f32; 4],
     v_axis: [f32; 4],
+    /// Quantized heights under the grid vertices, for picking and keeping the camera above ground.
+    grid: Vec<u16>,
 }
 
 impl TileSlot {
@@ -154,7 +157,7 @@ impl TileSlot {
                 },
             ],
         });
-        Self { albedo, dem, vertex_buffer, bind_group, origin: DVec3::ZERO, u_axis: [0.0; 4], v_axis: [0.0; 4] }
+        Self { albedo, dem, vertex_buffer, bind_group, origin: DVec3::ZERO, u_axis: [0.0; 4], v_axis: [0.0; 4], grid: Vec::new() }
     }
 
     fn upload(&mut self, queue: &wgpu::Queue, tile: TileId, albedo: &[u8], dem: &[u8]) {
@@ -168,6 +171,7 @@ impl TileSlot {
         let (du, dv) = texel_spacing(tile.face, tile.level, tile.x, tile.y).expect("cached tiles are inside the quadtree");
         self.u_axis = u_axis.as_vec3().extend(du as f32).to_array();
         self.v_axis = v_axis.as_vec3().extend(dv as f32).to_array();
+        self.grid = grid_heights(dem);
     }
 }
 
@@ -209,6 +213,19 @@ fn tycho_marker(device: &wgpu::Device) -> Mesh {
         }
     }
     Mesh::new(device, "Tycho Marker", up * MOON_RADIUS, &vertices, &indices, [1.0, 0.45, 0.2, 1.0])
+}
+
+/// Heights of the drawn `visible` tiles.
+fn drawn_terrain<'a>(streaming: Option<&'a Streaming>, visible: &'a [TileId], dem: DemQuantization) -> Option<DrawnTerrain<'a>> {
+    let streaming = streaming?;
+    let tiles = visible.iter().filter_map(|&tile| Some((tile, streaming.slots[streaming.cache.slot(tile)?].grid.as_slice())));
+    Some(DrawnTerrain::new(tiles, dem))
+}
+
+/// `[latitude°, longitude°, height above the reference sphere m]` of a body-fixed point.
+fn location(point: DVec3) -> Vec<f64> {
+    let r = point.length();
+    vec![(point.z / r).asin().to_degrees(), point.y.atan2(point.x).to_degrees(), r - MOON_RADIUS]
 }
 
 /// Per-object uniform: origin relative to the camera with the skirt depth, the wireframe colour, the origin itself
@@ -402,7 +419,7 @@ impl Renderer {
         self.camera.zoom(factor);
     }
 
-    /// Camera height above the reference sphere, in metres.
+    /// Camera height above the terrain under it, in metres.
     pub fn altitude(&self) -> f64 {
         self.camera.altitude()
     }
@@ -411,6 +428,21 @@ impl Renderer {
     /// so cracks stand out; bit 3 turns skirts off.
     pub fn set_debug_flags(&mut self, flags: u32) {
         self.debug_flags = flags;
+    }
+
+    /// Latitude and longitude in degrees and terrain height in metres of the point the camera orbits.
+    pub fn target_location(&self) -> Vec<f64> {
+        let target = self.camera.target();
+        location(target)
+    }
+
+    /// The terrain point under device pixel `(x, y)` of the canvas as `[latitude°, longitude°, height m]`, or
+    /// nothing if the pixel shows sky. Only drawn tiles count, so it matches what is on screen.
+    pub fn pick(&self, x: f64, y: f64) -> Option<Vec<f64>> {
+        let (width, height) = (self.config.width as f64, self.config.height as f64);
+        let ray = self.camera.ray(2.0 * x / width - 1.0, 1.0 - 2.0 * y / height, width / height);
+        let terrain = drawn_terrain(self.streaming.as_ref(), &self.visible_tiles, self.dem)?;
+        ray_terrain(self.camera.position(), ray, |dir| terrain.height_at(dir)).map(location)
     }
 
     /// Longitude of the sub-solar point in degrees (east positive).
@@ -490,6 +522,7 @@ impl Renderer {
         let aspect = self.config.width as f64 / self.config.height as f64;
         self.frame_index += 1;
         self.update_tiles(aspect, time_ms);
+        self.follow_terrain();
         if self.visible_tiles.len() > MAX_VISIBLE_TILES {
             return Err(JsValue::from_str(&format!("{} tiles exceed the {MAX_VISIBLE_TILES}-tile buffer", self.visible_tiles.len())));
         }
@@ -606,6 +639,23 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
         Ok(())
+    }
+
+    /// Moves the orbit target onto the drawn terrain and keeps the camera above it. The target height eases
+    /// towards the terrain, so a tile refining to slightly different heights does not make the view jump.
+    fn follow_terrain(&mut self) {
+        const EASE: f64 = 0.2;
+        const CLEARANCE_M: f64 = 1.0;
+        let Some(terrain) = drawn_terrain(self.streaming.as_ref(), &self.visible_tiles, self.dem) else { return };
+        let camera = &mut self.camera;
+        if let Some(height) = terrain.height_at(camera.target().normalize()) {
+            camera.target_height += (height - camera.target_height) * EASE;
+        }
+        let fallback = camera.target_height;
+        camera.lift_above_terrain(|dir| terrain.height_at(dir).unwrap_or(fallback), CLEARANCE_M);
+        if let Some(height) = terrain.height_at(camera.position().normalize()) {
+            camera.ground_height = height;
+        }
     }
 
     /// Selects this frame's tiles, then uploads finished fetches and starts or cancels fetches for the selection.
