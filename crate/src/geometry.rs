@@ -48,6 +48,11 @@ impl Face {
         }
     }
 
+    /// Inverse of [`Face::key`].
+    pub fn from_key(key: &str) -> Option<Self> {
+        Face::ALL.into_iter().find(|face| face.key() == key)
+    }
+
     /// Outward normal and the face's `u` and `v` axes, with `u × v = normal`.
     fn axes(self) -> (DVec3, DVec3, DVec3) {
         match self {
@@ -114,7 +119,7 @@ pub fn cube_to_latlon(face: Face, u: f64, v: f64) -> (f64, f64) {
     (s.z.atan2(s.x.hypot(s.y)), s.y.atan2(s.x))
 }
 
-/// Texture coordinate of face coordinate `t` in `[-1, 1]`, landing on texel centres of a shared-border tile.
+/// Texture coordinate of tile-local coordinate `t` in `[-1, 1]`, landing on texel centres of a shared-border tile.
 pub fn face_to_tile_uv(t: f64) -> f64 {
     let last = (TILE_SIZE - 1) as f64;
     ((t + 1.0) * 0.5 * last + 0.5) / TILE_SIZE as f64
@@ -132,7 +137,7 @@ pub fn tile_face_bounds(level: u8, x: u32, y: u32) -> Option<(f64, f64, f64, f64
 }
 
 /// Vertices of a `segments × segments` grid over a quadtree tile, as f32 offsets from the tile's f64 centre.
-/// Returns the centre and interleaved `[offset.xyz, normal.xyz, uv.xy]`; `uv` addresses the face's level-0 tile.
+/// Returns the centre and interleaved `[offset.xyz, normal.xyz, uv.xy]`; `uv` addresses the tile's own texture.
 pub fn tile_vertices(face: Face, level: u8, x: u32, y: u32, segments: u32) -> Option<(DVec3, Vec<f32>)> {
     let (u0, u1, v0, v1) = tile_face_bounds(level, x, y)?;
     if segments == 0 {
@@ -143,9 +148,8 @@ pub fn tile_vertices(face: Face, level: u8, x: u32, y: u32, segments: u32) -> Op
     let mut vertices = Vec::with_capacity((side * side * 8) as usize);
     for j in 0..side {
         for i in 0..side {
-            let u = u0 + (u1 - u0) * i as f64 / segments as f64;
-            let v = v0 + (v1 - v0) * j as f64 / segments as f64;
-            let s = cube_to_unit(face, u, v);
+            let (s_i, s_j) = (i as f64 / segments as f64, j as f64 / segments as f64);
+            let s = cube_to_unit(face, u0 + (u1 - u0) * s_i, v0 + (v1 - v0) * s_j);
             let offset = (s * MOON_RADIUS - origin).as_vec3();
             let normal = s.as_vec3();
             vertices.extend_from_slice(&[
@@ -155,8 +159,8 @@ pub fn tile_vertices(face: Face, level: u8, x: u32, y: u32, segments: u32) -> Op
                 normal.x,
                 normal.y,
                 normal.z,
-                face_to_tile_uv(u) as f32,
-                face_to_tile_uv(v) as f32,
+                face_to_tile_uv(2.0 * s_i - 1.0) as f32,
+                face_to_tile_uv(2.0 * s_j - 1.0) as f32,
             ]);
         }
     }

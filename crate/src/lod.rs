@@ -200,6 +200,16 @@ pub struct LodSelection {
     pub requests: Vec<TileId>,
 }
 
+/// Whether a tile's data can be drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileStatus {
+    Ready,
+    /// Not loaded yet, but it exists (or might).
+    Pending,
+    /// Not in the dataset, or it failed for good.
+    Unavailable,
+}
+
 /// Split candidate ordered by screen-space error.
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
@@ -252,14 +262,15 @@ impl Selector<'_> {
 ///
 /// Starting from the six faces, it repeatedly splits the selected tile with the largest screen-space error,
 /// replacing it by its visible children. A split waits until every visible child is ready, keeping the parent
-/// meanwhile, so the surface never has holes; missing children are returned as requests. Refinement stops at
+/// meanwhile, so the surface never has holes; pending children are returned as requests. A tile with an
+/// unavailable visible child never splits, which ends refinement where the dataset runs out. Refinement stops at
 /// the first split that would exceed `max_visible_tiles`, so a tight budget goes to the most needed detail.
 pub fn select_tiles(
     camera: &OrbitCamera,
     viewport_height: u32,
     aspect: f64,
     config: &LodConfig,
-    is_ready: impl Fn(TileId) -> bool,
+    status: impl Fn(TileId) -> TileStatus,
 ) -> LodSelection {
     let max_tiles = config.max_visible_tiles.max(Face::ALL.len());
     let mut selector = Selector {
@@ -278,10 +289,10 @@ pub fn select_tiles(
         if !selector.view.sees(&bounds) {
             continue;
         }
-        if is_ready(root) {
-            selector.select(root, &bounds);
-        } else {
-            requests.push(Candidate { error_px: f64::INFINITY, tile: root });
+        match status(root) {
+            TileStatus::Ready => selector.select(root, &bounds),
+            TileStatus::Pending => requests.push(Candidate { error_px: f64::INFINITY, tile: root }),
+            TileStatus::Unavailable => {}
         }
     }
 
@@ -300,9 +311,13 @@ pub fn select_tiles(
         if selector.selected.len() - 1 + children.len() > max_tiles {
             break;
         }
-        let missing: Vec<_> = children.iter().map(|&(child, _)| child).filter(|&child| !is_ready(child)).collect();
-        if !missing.is_empty() {
-            requests.extend(missing.into_iter().map(|tile| Candidate { error_px, tile }));
+        let statuses: Vec<_> = children.iter().map(|&(child, _)| (child, status(child))).collect();
+        if statuses.iter().any(|&(_, s)| s == TileStatus::Unavailable) {
+            continue;
+        }
+        let pending: Vec<_> = statuses.into_iter().filter(|&(_, s)| s == TileStatus::Pending).collect();
+        if !pending.is_empty() {
+            requests.extend(pending.into_iter().map(|(tile, _)| Candidate { error_px, tile }));
             continue;
         }
         selector.selected.remove(&tile);
@@ -320,25 +335,10 @@ pub fn select_tiles(
     }
 }
 
-/// Tiles to drop from a cache of `(tile, last_used_frame)` entries so that at most `capacity` remain, least
-/// recently used first. Face roots and tiles used in `frame` are never dropped, so the cache can stay above
-/// `capacity` when everything in it is in use.
-pub fn tiles_to_evict(entries: impl IntoIterator<Item = (TileId, u64)>, frame: u64, capacity: usize) -> Vec<TileId> {
-    let entries: Vec<_> = entries.into_iter().collect();
-    let excess = entries.len().saturating_sub(capacity);
-    let mut candidates: Vec<_> = entries
-        .into_iter()
-        .filter(|&(tile, last_used)| tile.level > 0 && last_used < frame)
-        .map(|(tile, last_used)| (last_used, tile))
-        .collect();
-    candidates.sort_unstable();
-    candidates.into_iter().take(excess).map(|(_, tile)| tile).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{tile_vertices, unit_to_cube};
+    use crate::geometry::{latlon_to_unit, tile_vertices, unit_to_cube};
 
     const ASPECT: f64 = 16.0 / 9.0;
     const HEIGHT_PX: u32 = 1080;
@@ -353,8 +353,12 @@ mod tests {
         camera
     }
 
-    fn select(camera: &OrbitCamera, config: &LodConfig, is_ready: impl Fn(TileId) -> bool) -> LodSelection {
-        select_tiles(camera, HEIGHT_PX, ASPECT, config, is_ready)
+    fn select(camera: &OrbitCamera, config: &LodConfig, status: impl Fn(TileId) -> TileStatus) -> LodSelection {
+        select_tiles(camera, HEIGHT_PX, ASPECT, config, status)
+    }
+
+    fn all_ready(_: TileId) -> TileStatus {
+        TileStatus::Ready
     }
 
     fn all_views() -> impl Iterator<Item = (f64, f64, OrbitCamera)> {
@@ -463,7 +467,7 @@ mod tests {
     fn selection_covers_every_view_without_holes_or_overlap() {
         let config = LodConfig::default();
         for (distance, elevation, camera) in all_views() {
-            let selection = select(&camera, &config, |_| true);
+            let selection = select(&camera, &config, all_ready);
             assert!(selection.requests.is_empty());
             assert_covers_view_without_overlap(&camera, &selection.tiles, &format!("{distance} m at {elevation}°"));
         }
@@ -472,11 +476,14 @@ mod tests {
     #[test]
     fn partial_readiness_never_leaves_holes_and_requests_only_missing_tiles() {
         let config = LodConfig::default();
-        let is_ready = |t: TileId| t.level <= 1 || (t.x * 7 + t.y * 13 + t.level as u32) % 4 != 0;
+        let status = |t: TileId| match t.level <= 1 || (t.x * 7 + t.y * 13 + t.level as u32) % 4 != 0 {
+            true => TileStatus::Ready,
+            false => TileStatus::Pending,
+        };
         for (distance, elevation, camera) in all_views() {
-            let selection = select(&camera, &config, is_ready);
-            assert!(selection.tiles.iter().all(|&t| is_ready(t)));
-            assert!(selection.requests.iter().all(|&t| !is_ready(t)));
+            let selection = select(&camera, &config, status);
+            assert!(selection.tiles.iter().all(|&t| status(t) == TileStatus::Ready));
+            assert!(selection.requests.iter().all(|&t| status(t) == TileStatus::Pending));
             assert_covers_view_without_overlap(&camera, &selection.tiles, &format!("{distance} m at {elevation}°"));
         }
     }
@@ -485,7 +492,10 @@ mod tests {
     fn parent_stays_until_all_visible_children_are_ready() {
         let camera = camera(1_000.0, 90.0);
         let missing = tile_at(camera.target(), 1);
-        let selection = select(&camera, &LodConfig::default(), |t| t != missing);
+        let selection = select(&camera, &LodConfig::default(), |t| match t == missing {
+            true => TileStatus::Pending,
+            false => TileStatus::Ready,
+        });
 
         let root = TileId::root(missing.face);
         assert!(selection.tiles.contains(&root));
@@ -495,23 +505,51 @@ mod tests {
     }
 
     #[test]
+    fn refinement_ends_where_the_dataset_does() {
+        // Like v2: levels 0-3 everywhere, deeper levels only as complete sibling sets around Tycho.
+        let tycho = latlon_to_unit(TYCHO.0.to_radians(), TYCHO.1.to_radians());
+        let status = |t: TileId| match t.level <= 3 || t.parent() == Some(tile_at(tycho, t.level - 1)) {
+            true => TileStatus::Ready,
+            false => TileStatus::Unavailable,
+        };
+        let config = LodConfig::default();
+        for elevation in ELEVATIONS_DEG {
+            let away = {
+                let mut camera = OrbitCamera::new(20.0, 60.0, 1_000.0);
+                camera.elevation = elevation.to_radians();
+                camera
+            };
+            let selection = select(&away, &config, status);
+            assert!(selection.requests.is_empty());
+            assert!(selection.tiles.iter().all(|t| t.level <= 3));
+            assert_covers_view_without_overlap(&away, &selection.tiles, &format!("away at {elevation}°"));
+
+            let over_tycho = camera(1_000.0, elevation);
+            let selection = select(&over_tycho, &config, status);
+            assert!(selection.requests.is_empty());
+            assert!(selection.tiles.contains(&tile_at(tycho, 7)), "{elevation}°: Tycho not at level 7");
+            assert_covers_view_without_overlap(&over_tycho, &selection.tiles, &format!("Tycho at {elevation}°"));
+        }
+    }
+
+    #[test]
     fn typical_views_fit_well_inside_the_budget() {
         let config = LodConfig::default();
         let unbounded = LodConfig { max_visible_tiles: usize::MAX, ..LodConfig::default() };
         for (distance, elevation, camera) in all_views() {
-            let tiles = select(&camera, &config, |_| true).tiles;
+            let tiles = select(&camera, &config, all_ready).tiles;
             assert!(tiles.len() <= MAX_VISIBLE_TILES / 4, "{distance} m at {elevation}°: {} tiles", tiles.len());
-            assert_eq!(tiles, select(&camera, &unbounded, |_| true).tiles, "{distance} m at {elevation}°: budget-limited");
+            assert_eq!(tiles, select(&camera, &unbounded, all_ready).tiles, "{distance} m at {elevation}°: budget-limited");
         }
     }
 
     #[test]
     fn tight_budget_is_respected_and_spent_on_the_nearest_terrain() {
         let camera = camera(601_100.0, 30.0);
-        let unbounded = select(&camera, &LodConfig { max_visible_tiles: usize::MAX, ..LodConfig::default() }, |_| true);
+        let unbounded = select(&camera, &LodConfig { max_visible_tiles: usize::MAX, ..LodConfig::default() }, all_ready);
         for budget in [6, 12, 24, 40] {
             let config = LodConfig { max_visible_tiles: budget, ..LodConfig::default() };
-            let tiles = select(&camera, &config, |_| true).tiles;
+            let tiles = select(&camera, &config, all_ready).tiles;
             assert!(unbounded.tiles.len() > budget);
             assert!(tiles.len() <= budget, "budget {budget}: {} tiles", tiles.len());
             assert_covers_view_without_overlap(&camera, &tiles, &format!("budget {budget}"));
@@ -532,7 +570,7 @@ mod tests {
         let mut previous = 0;
         for distance in DISTANCES {
             let camera = camera(distance, 90.0);
-            let tiles = select(&camera, &config, |_| true).tiles;
+            let tiles = select(&camera, &config, all_ready).tiles;
             let level = (0..=config.max_level)
                 .rev()
                 .find(|&l| tiles.contains(&tile_at(camera.target(), l)))
@@ -545,7 +583,7 @@ mod tests {
 
     #[test]
     fn distant_moon_is_drawn_from_the_face_roots() {
-        let tiles = select(&camera(10.0 * MOON_RADIUS, 90.0), &LodConfig::default(), |_| true).tiles;
+        let tiles = select(&camera(10.0 * MOON_RADIUS, 90.0), &LodConfig::default(), all_ready).tiles;
         assert!(!tiles.is_empty() && tiles.len() <= 6);
         assert!(tiles.iter().all(|t| t.level == 0));
     }
@@ -574,16 +612,6 @@ mod tests {
         // A 10.8 km peak is visible up to ~6.4° beyond the geometric horizon.
         assert!(view.above_horizon(&tile_at_angle(65.0)));
         assert!(!view.above_horizon(&tile_at_angle(68.0)));
-    }
-
-    #[test]
-    fn eviction_drops_least_recently_used_tiles_but_never_roots_or_tiles_in_use() {
-        let tile = |level, x| TileId { face: Face::Pz, level, x, y: 0 };
-        let entries = [(tile(0, 0), 1), (tile(3, 1), 7), (tile(3, 2), 2), (tile(3, 3), 5), (tile(3, 4), 9), (tile(3, 5), 9)];
-        assert!(tiles_to_evict(entries, 9, 6).is_empty());
-        assert_eq!(tiles_to_evict(entries, 9, 4), [tile(3, 2), tile(3, 3)]);
-        // Only three tiles are evictable: the root and the two used this frame stay even above capacity.
-        assert_eq!(tiles_to_evict(entries, 9, 0), [tile(3, 2), tile(3, 3), tile(3, 1)]);
     }
 
     #[test]

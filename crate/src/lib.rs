@@ -1,9 +1,11 @@
 mod camera;
 mod geometry;
 mod lod;
+mod manifest;
 // Canvas surfaces only exist on wasm32; gating lets `cargo test` build on the host.
 #[cfg(target_arch = "wasm32")]
 mod renderer;
+mod streaming;
 mod tiles;
 
 use wasm_bindgen::prelude::*;

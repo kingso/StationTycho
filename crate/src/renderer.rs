@@ -1,12 +1,19 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::camera::OrbitCamera;
 use crate::geometry::{enu_frame, grid_indices, tile_vertices, Face, MOON_RADIUS};
-use crate::lod::{select_tiles, tiles_to_evict, LodConfig, TileId, MAX_VISIBLE_TILES, TILE_SEGMENTS};
-use crate::tiles::{tile_path, Layer, TILE_SIZE};
+use crate::lod::{select_tiles, LodConfig, TileId, MAX_VISIBLE_TILES, TILE_SEGMENTS};
+use crate::manifest::Manifest;
+use crate::streaming::{
+    tile_gpu_bytes, Completion, FetchResult, TileCache, GPU_TILE_BUDGET_BYTES, MAX_IN_FLIGHT_TILES,
+};
+use crate::tiles::{manifest_path, tile_path, Layer, TILE_SIZE};
 use glam::DVec3;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 use web_sys::console;
 use wgpu::util::DeviceExt;
 
@@ -25,11 +32,6 @@ const DEM_BYTES: usize = (TILE_SIZE * TILE_SIZE * 2) as usize;
 
 const TYCHO_LAT_DEG: f64 = -43.31;
 const TYCHO_LON_DEG: f64 = -11.36;
-
-// Each cached tile holds only its 81 vertices (2.6 KB), so the cache stays near 10 MB.
-const MAX_CACHED_TILE_MESHES: usize = MAX_VISIBLE_TILES * 4;
-// Spreads mesh creation after a fast zoom over several frames.
-const MAX_TILE_MESHES_PER_FRAME: usize = 64;
 
 fn face_color(face: Face) -> [f32; 4] {
     match face {
@@ -99,27 +101,69 @@ impl TileGrid {
     }
 }
 
-/// Vertices of one quadtree tile, drawn with the shared [`TileGrid`] indices.
-struct TileMesh {
+/// GPU resources of one tile-cache slot, reused by whichever tile the cache assigns to it.
+struct TileSlot {
+    albedo: wgpu::Texture,
+    dem: wgpu::Texture,
     vertex_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// Centre of the tile now in the slot; its vertices are offsets from it.
     origin: DVec3,
-    /// Index into `Face::ALL`, selecting the face textures.
-    face: usize,
-    last_used_frame: u64,
 }
 
-impl TileMesh {
-    fn new(device: &wgpu::Device, tile: TileId, frame: u64) -> Option<Self> {
-        let face = Face::ALL.iter().position(|&f| f == tile.face)?;
-        let (origin, vertices) = tile_vertices(tile.face, tile.level, tile.x, tile.y, TILE_SEGMENTS)?;
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+impl TileSlot {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) -> Self {
+        let albedo = create_tile_texture(device, "Tile Albedo", wgpu::TextureFormat::Rgba8UnormSrgb);
+        let dem = create_tile_texture(device, "Tile DEM", wgpu::TextureFormat::R16Uint);
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Tile Vertices"),
-            contents: &f32_bytes(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            size: VERTEX_STRIDE * u64::from((TILE_SEGMENTS + 1) * (TILE_SEGMENTS + 1)),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        Some(Self { vertex_buffer, origin, face, last_used_frame: frame })
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Tile Textures"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&albedo.create_view(&Default::default())),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&dem.create_view(&Default::default())),
+                },
+            ],
+        });
+        Self { albedo, dem, vertex_buffer, bind_group, origin: DVec3::ZERO }
+    }
+
+    fn upload(&mut self, queue: &wgpu::Queue, tile: TileId, albedo: &[u8], dem: &[u8]) {
+        let (origin, vertices) =
+            tile_vertices(tile.face, tile.level, tile.x, tile.y, TILE_SEGMENTS).expect("cached tiles are inside the quadtree");
+        write_tile(queue, &self.albedo, albedo, 4);
+        write_tile(queue, &self.dem, dem, 2);
+        queue.write_buffer(&self.vertex_buffer, 0, &f32_bytes(&vertices));
+        self.origin = origin;
     }
 }
+
+/// Tile cache plus the GPU slots and open requests it manages; exists once the manifest has loaded.
+struct Streaming {
+    cache: TileCache,
+    slots: Vec<TileSlot>,
+    requests: HashMap<u64, web_sys::AbortController>,
+}
+
+/// A finished tile fetch, processed on the next frame.
+struct Fetched {
+    tile: TileId,
+    request: u64,
+    result: Result<(Vec<u8>, Vec<u8>), FetchResult>,
+}
+
+type Inbox = Rc<RefCell<Vec<Fetched>>>;
 
 /// 20 m wireframe cube standing on the reference sphere at Tycho's centre.
 fn tycho_marker(device: &wgpu::Device) -> Mesh {
@@ -150,13 +194,6 @@ fn object_uniform(origin: DVec3, color: [f32; 4], camera_position: DVec3) -> Vec
     let rel = (origin - camera_position).as_vec3();
     let [r, g, b, a] = color;
     f32_bytes(&[rel.x, rel.y, rel.z, 0.0, r, g, b, a])
-}
-
-/// Albedo and height textures for one cube face, starting as flat grey placeholders.
-struct FaceTextures {
-    albedo: wgpu::Texture,
-    dem: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
 }
 
 fn create_tile_texture(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat) -> wgpu::Texture {
@@ -190,40 +227,68 @@ fn write_tile(queue: &wgpu::Queue, texture: &wgpu::Texture, data: &[u8], bytes_p
     );
 }
 
-async fn fetch_bytes(path: &str) -> Result<Vec<u8>, JsValue> {
-    let window = web_sys::window().ok_or_else(|| JsValue::from_str("No global window"))?;
-    let response: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(path)).await?.dyn_into()?;
-    if !response.ok() {
-        return Err(JsValue::from_str(&format!("{path}: HTTP {}", response.status())));
+async fn read_body(response: JsFuture) -> Result<Vec<u8>, FetchResult> {
+    let response: web_sys::Response = response.await.and_then(|r| r.dyn_into()).map_err(|_| FetchResult::Failed)?;
+    match response.status() {
+        404 => return Err(FetchResult::NotFound),
+        _ if !response.ok() => return Err(FetchResult::Failed),
+        _ => {}
     }
-    let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer()?).await?;
+    let body = response.array_buffer().map_err(|_| FetchResult::Failed)?;
+    let buffer = JsFuture::from(body).await.map_err(|_| FetchResult::Failed)?;
     Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
-/// Level-0 albedo and height tiles for one cube face.
-#[wasm_bindgen]
-pub struct FaceTile {
-    face: usize,
-    albedo: Vec<u8>,
-    dem: Vec<u8>,
+/// Fetches a tile's albedo and DEM in parallel; `signal` aborts both.
+async fn fetch_tile_data(tile: TileId, signal: &web_sys::AbortSignal) -> Result<(Vec<u8>, Vec<u8>), FetchResult> {
+    let window = web_sys::window().ok_or(FetchResult::Failed)?;
+    let init = web_sys::RequestInit::new();
+    init.set_signal(Some(signal));
+    let path = |layer| tile_path(layer, tile.face, u32::from(tile.level), tile.x, tile.y);
+    // Wrapping both promises now attaches their handlers, and both are always awaited, so aborting never leaves
+    // an unhandled rejection.
+    let albedo = JsFuture::from(window.fetch_with_str_and_init(&path(Layer::Albedo), &init));
+    let dem = JsFuture::from(window.fetch_with_str_and_init(&path(Layer::Dem), &init));
+    let (albedo, dem) = (read_body(albedo).await, read_body(dem).await);
+    let (albedo, dem) = (albedo?, dem?);
+    if albedo.len() != ALBEDO_BYTES || dem.len() != DEM_BYTES {
+        return Err(FetchResult::Corrupt);
+    }
+    Ok((albedo, dem))
 }
 
-/// Fetches the level-0 tiles for face `face` (0..6, in `Face::ALL` order) from R2.
+/// Starts fetching `tile`; the result lands in `inbox` unless the returned controller aborts it first.
+fn spawn_fetch(inbox: &Inbox, tile: TileId, request: u64) -> Option<web_sys::AbortController> {
+    let controller = web_sys::AbortController::new().ok();
+    let signal = controller.as_ref().map(|c| c.signal());
+    let inbox = inbox.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = match &signal {
+            Some(signal) => fetch_tile_data(tile, signal).await,
+            None => Err(FetchResult::Failed),
+        };
+        if !signal.is_some_and(|s| s.aborted()) {
+            inbox.borrow_mut().push(Fetched { tile, request, result });
+        }
+    });
+    controller
+}
+
+/// The dataset manifest, from [`fetch_manifest`] for [`Renderer::set_manifest`].
 #[wasm_bindgen]
-pub async fn fetch_face_tile(face: usize) -> Result<FaceTile, JsValue> {
-    let key = *Face::ALL.get(face).ok_or_else(|| JsValue::from_str(&format!("No face {face}")))?;
-    let albedo_path = tile_path(Layer::Albedo, key, 0, 0, 0);
-    let dem_path = tile_path(Layer::Dem, key, 0, 0, 0);
-    let albedo = fetch_bytes(&albedo_path).await?;
-    let dem = fetch_bytes(&dem_path).await?;
-    if albedo.len() != ALBEDO_BYTES || dem.len() != DEM_BYTES {
-        return Err(JsValue::from_str(&format!(
-            "{albedo_path} / {dem_path}: expected {ALBEDO_BYTES} / {DEM_BYTES} bytes, got {} / {}",
-            albedo.len(),
-            dem.len()
-        )));
+pub struct TileManifest(Manifest);
+
+/// Fetches and parses the dataset manifest.
+#[wasm_bindgen]
+pub async fn fetch_manifest() -> Result<TileManifest, JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("No global window"))?;
+    let path = manifest_path();
+    let response: web_sys::Response = JsFuture::from(window.fetch_with_str(&path)).await?.dyn_into()?;
+    if !response.ok() {
+        return Err(JsValue::from_str(&format!("{path}: HTTP {}", response.status())));
     }
-    Ok(FaceTile { face, albedo, dem })
+    let text = JsFuture::from(response.text()?).await?.as_string().unwrap_or_default();
+    Manifest::parse(&text).map(TileManifest).map_err(|e| JsValue::from_str(&e))
 }
 
 fn create_depth_target(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
@@ -256,12 +321,14 @@ pub struct Renderer {
     object_stride: u64,
     lod_config: LodConfig,
     tile_grid: TileGrid,
-    /// Tiles whose mesh is built; the LOD selector treats exactly these as ready.
-    tile_meshes: HashMap<TileId, TileMesh>,
+    tile_layout: wgpu::BindGroupLayout,
+    albedo_sampler: wgpu::Sampler,
+    streaming: Option<Streaming>,
+    inbox: Inbox,
+    /// Resident tiles drawn this frame; the LOD selector only returns resident tiles.
     visible_tiles: Vec<TileId>,
     marker: Mesh,
     frame_index: u64,
-    faces: Vec<FaceTextures>,
     debug_flags: u32,
     camera: OrbitCamera,
     _depth_texture: wgpu::Texture,
@@ -321,47 +388,88 @@ impl Renderer {
         self.visible_tiles.iter().map(|t| u32::from(t.level)).max().unwrap_or(0)
     }
 
-    /// Number of tile meshes held on the GPU.
-    pub fn cached_tile_count(&self) -> u32 {
-        self.tile_meshes.len() as u32
+    /// Tiles resident on the GPU.
+    pub fn resident_tile_count(&self) -> u32 {
+        self.streaming.as_ref().map_or(0, |s| s.cache.resident() as u32)
     }
 
-    /// Uploads a face's tiles from [`fetch_face_tile`] into its GPU textures.
-    pub fn upload_face_tile(&mut self, tile: FaceTile) {
-        let face = &self.faces[tile.face];
-        write_tile(&self.queue, &face.albedo, &tile.albedo, 4);
-        write_tile(&self.queue, &face.dem, &tile.dem, 2);
+    /// Most tiles the GPU budget allows.
+    pub fn tile_capacity(&self) -> u32 {
+        self.streaming.as_ref().map_or(0, |s| s.cache.capacity() as u32)
     }
 
-    /// Renders one frame. `_time_ms` is the requestAnimationFrame timestamp.
-    pub fn render(&mut self, _time_ms: f64) -> Result<(), JsValue> {
+    /// GPU memory allocated for tile slots, in MiB.
+    pub fn tile_gpu_megabytes(&self) -> f64 {
+        self.streaming.as_ref().map_or(0.0, |s| (s.slots.len() as u64 * tile_gpu_bytes()) as f64 / (1u64 << 20) as f64)
+    }
+
+    /// Tiles being fetched.
+    pub fn loading_tile_count(&self) -> u32 {
+        self.streaming.as_ref().map_or(0, |s| s.cache.in_flight() as u32)
+    }
+
+    /// Tile fetches cancelled so far because the view moved on.
+    pub fn cancelled_tile_count(&self) -> f64 {
+        self.streaming.as_ref().map_or(0.0, |s| s.cache.stats().cancelled as f64)
+    }
+
+    /// Tile fetches that failed so far (network or server errors, retried with backoff).
+    pub fn failed_tile_count(&self) -> f64 {
+        self.streaming.as_ref().map_or(0.0, |s| s.cache.stats().failed as f64)
+    }
+
+    /// Starts streaming tiles listed in `manifest`; nothing is drawn before this.
+    pub fn set_manifest(&mut self, manifest: TileManifest) {
+        let manifest = manifest.0;
+        if let Some(old) = self.streaming.take() {
+            old.requests.values().for_each(web_sys::AbortController::abort);
+        }
+        self.lod_config = LodConfig {
+            max_level: manifest.max_level(),
+            terrain_error_m: manifest.geometric_error_m.clone(),
+            ..LodConfig::default()
+        };
+        let capacity = (GPU_TILE_BUDGET_BYTES / tile_gpu_bytes()) as usize;
+        self.streaming = Some(Streaming {
+            cache: TileCache::new(manifest, capacity, MAX_IN_FLIGHT_TILES),
+            slots: Vec::new(),
+            requests: HashMap::new(),
+        });
+    }
+
+    /// Renders one frame. `time_ms` is the requestAnimationFrame timestamp.
+    pub fn render(&mut self, time_ms: f64) -> Result<(), JsValue> {
         let aspect = self.config.width as f64 / self.config.height as f64;
         self.frame_index += 1;
-        let tile_meshes = &self.tile_meshes;
-        let selection =
-            select_tiles(&self.camera, self.config.height, aspect, &self.lod_config, |tile| tile_meshes.contains_key(&tile));
-        self.visible_tiles = selection.tiles;
+        self.update_tiles(aspect, time_ms);
         if self.visible_tiles.len() > MAX_VISIBLE_TILES {
             return Err(JsValue::from_str(&format!("{} tiles exceed the {MAX_VISIBLE_TILES}-tile buffer", self.visible_tiles.len())));
         }
-        self.mark_visible_tiles_used();
-        self.build_tile_meshes(&selection.requests);
-        self.evict_tile_meshes();
+        let drawn: Vec<(&TileSlot, [f32; 4])> = match &self.streaming {
+            Some(streaming) => self
+                .visible_tiles
+                .iter()
+                .map(|tile| {
+                    let slot = streaming.cache.slot(*tile).expect("selected tiles are resident");
+                    (&streaming.slots[slot], face_color(tile.face))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
 
         let view_proj = self.camera.view_proj(aspect);
         let mut frame_data = f32_bytes(&view_proj.to_cols_array());
         frame_data.extend_from_slice(&u32_bytes(&[self.debug_flags, 0, 0, 0]));
         self.queue.write_buffer(&self.frame_buffer, 0, &frame_data);
 
-        // Visible tiles take the first slots and the marker the last; selection only returns tiles with meshes.
+        // Visible tiles take the first uniform slots and the marker the last.
         let camera_pos = self.camera.position();
         let stride = self.object_stride as usize;
-        let visible_count = self.visible_tiles.len();
+        let visible_count = drawn.len();
         let mut objects = vec![0u8; stride * (visible_count + 1)];
-        for (i, tile) in self.visible_tiles.iter().enumerate() {
-            let origin = self.tile_meshes[tile].origin;
+        for (i, (slot, color)) in drawn.iter().enumerate() {
             objects[i * stride..i * stride + OBJECT_UNIFORM_SIZE as usize]
-                .copy_from_slice(&object_uniform(origin, face_color(tile.face), camera_pos));
+                .copy_from_slice(&object_uniform(slot.origin, *color, camera_pos));
         }
         objects[visible_count * stride..visible_count * stride + OBJECT_UNIFORM_SIZE as usize]
             .copy_from_slice(&object_uniform(self.marker.origin, self.marker.color, camera_pos));
@@ -410,20 +518,19 @@ impl Renderer {
 
             pass.set_pipeline(&self.terrain_pipeline);
             pass.set_index_buffer(self.tile_grid.triangles.slice(..), wgpu::IndexFormat::Uint32);
-            for (i, tile) in self.visible_tiles.iter().enumerate() {
-                let mesh = &self.tile_meshes[tile];
+            for (i, (slot, _)) in drawn.iter().enumerate() {
                 pass.set_bind_group(1, &self.object_bind_group, &[(i as u64 * self.object_stride) as u32]);
-                pass.set_bind_group(2, &self.faces[mesh.face].bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_bind_group(2, &slot.bind_group, &[]);
+                pass.set_vertex_buffer(0, slot.vertex_buffer.slice(..));
                 pass.draw_indexed(0..self.tile_grid.triangle_count, 0, 0..1);
             }
 
             pass.set_pipeline(&self.line_pipeline);
             if self.debug_flags & DEBUG_WIREFRAME != 0 {
                 pass.set_index_buffer(self.tile_grid.lines.slice(..), wgpu::IndexFormat::Uint32);
-                for (i, tile) in self.visible_tiles.iter().enumerate() {
+                for (i, (slot, _)) in drawn.iter().enumerate() {
                     pass.set_bind_group(1, &self.object_bind_group, &[(i as u64 * self.object_stride) as u32]);
-                    pass.set_vertex_buffer(0, self.tile_meshes[tile].vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(0, slot.vertex_buffer.slice(..));
                     pass.draw_indexed(0..self.tile_grid.line_count, 0, 0..1);
                 }
             }
@@ -438,40 +545,49 @@ impl Renderer {
         Ok(())
     }
 
-    /// Marks visible tiles and their ancestors as used, so eviction keeps every tile needed to merge back.
-    fn mark_visible_tiles_used(&mut self) {
-        for &tile in &self.visible_tiles {
+    /// Selects this frame's tiles, then uploads finished fetches and starts or cancels fetches for the selection.
+    fn update_tiles(&mut self, aspect: f64, now_ms: f64) {
+        let frame = self.frame_index;
+        let Some(streaming) = &mut self.streaming else {
+            self.visible_tiles.clear();
+            return;
+        };
+        let cache = &streaming.cache;
+        let selection = select_tiles(&self.camera, self.config.height, aspect, &self.lod_config, |t| cache.status(t));
+        // Visible tiles and their ancestors (all resident, since selection only splits ready tiles) are marked
+        // used, so the uploads below cannot evict them and zooming out can merge back without reloading.
+        for &tile in &selection.tiles {
             let mut current = Some(tile);
-            while let Some(t) = current {
-                match self.tile_meshes.get_mut(&t) {
-                    Some(mesh) if mesh.last_used_frame != self.frame_index => mesh.last_used_frame = self.frame_index,
-                    // Already marked through a sibling, so the rest of the chain is marked too.
-                    Some(_) => break,
-                    None => {}
-                }
+            while let Some(t) = current.filter(|&t| streaming.cache.touch(t, frame)) {
                 current = t.parent();
             }
         }
-    }
+        self.visible_tiles = selection.tiles;
 
-    /// Builds meshes for the most urgent requested tiles, at most `MAX_TILE_MESHES_PER_FRAME` per frame.
-    fn build_tile_meshes(&mut self, requests: &[TileId]) {
-        for &tile in requests.iter().take(MAX_TILE_MESHES_PER_FRAME) {
-            if let Some(mesh) = TileMesh::new(&self.device, tile, self.frame_index) {
-                self.tile_meshes.insert(tile, mesh);
+        let fetched = std::mem::take(&mut *self.inbox.borrow_mut());
+        for Fetched { tile, request, result } in fetched {
+            streaming.requests.remove(&request);
+            let outcome = result.as_ref().err().copied().unwrap_or(FetchResult::Loaded);
+            if let (Completion::Upload { slot, .. }, Ok((albedo, dem))) =
+                (streaming.cache.complete(tile, request, outcome, frame, now_ms), &result)
+            {
+                while streaming.slots.len() <= slot {
+                    streaming.slots.push(TileSlot::new(&self.device, &self.tile_layout, &self.albedo_sampler));
+                }
+                streaming.slots[slot].upload(&self.queue, tile, albedo, dem);
             }
         }
-    }
 
-    /// Evicts least recently used tile meshes above `MAX_CACHED_TILE_MESHES`, keeping roots and tiles used or
-    /// built this frame.
-    fn evict_tile_meshes(&mut self) {
-        if self.tile_meshes.len() <= MAX_CACHED_TILE_MESHES {
-            return;
+        let (start, cancel) = streaming.cache.schedule(&selection.requests, frame, now_ms);
+        for (_, request) in cancel {
+            if let Some(controller) = streaming.requests.remove(&request) {
+                controller.abort();
+            }
         }
-        let entries = self.tile_meshes.iter().map(|(&tile, mesh)| (tile, mesh.last_used_frame));
-        for tile in tiles_to_evict(entries, self.frame_index, MAX_CACHED_TILE_MESHES) {
-            self.tile_meshes.remove(&tile);
+        for (tile, request) in start {
+            if let Some(controller) = spawn_fetch(&self.inbox, tile, request) {
+                streaming.requests.insert(request, controller);
+            }
         }
     }
 }
@@ -556,11 +672,6 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
     });
 
     let marker = tycho_marker(&device);
-    // Face roots are always ready, so the selector can start from them on the first frame.
-    let tile_meshes = Face::ALL
-        .into_iter()
-        .filter_map(|face| Some((TileId::root(face), TileMesh::new(&device, TileId::root(face), 0)?)))
-        .collect();
 
     let object_stride = OBJECT_UNIFORM_SIZE.max(device.limits().min_uniform_buffer_offset_alignment as u64);
     let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -632,8 +743,8 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         },
         count: None,
     };
-    let face_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Face Texture Layout"),
+    let tile_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Tile Texture Layout"),
         entries: &[
             texture_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
             wgpu::BindGroupLayoutEntry {
@@ -647,7 +758,7 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
     });
     let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Terrain Pipeline Layout"),
-        bind_group_layouts: &[Some(&frame_layout), Some(&object_layout), Some(&face_layout)],
+        bind_group_layouts: &[Some(&frame_layout), Some(&object_layout), Some(&tile_layout)],
         immediate_size: 0,
     });
 
@@ -657,32 +768,6 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    let placeholder_albedo = [0x50u8, 0x50, 0x50, 0xff].repeat((TILE_SIZE * TILE_SIZE) as usize);
-    let faces = Face::ALL
-        .iter()
-        .map(|face| {
-            let albedo = create_tile_texture(&device, &format!("Albedo {}", face.key()), wgpu::TextureFormat::Rgba8UnormSrgb);
-            let dem = create_tile_texture(&device, &format!("DEM {}", face.key()), wgpu::TextureFormat::R16Uint);
-            write_tile(&queue, &albedo, &placeholder_albedo, 4);
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Face Textures"),
-                layout: &face_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&albedo.create_view(&Default::default())),
-                    },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&albedo_sampler) },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&dem.create_view(&Default::default())),
-                    },
-                ],
-            });
-            FaceTextures { albedo, dem, bind_group }
-        })
-        .collect();
-
     // Push the surface back by one pixel's worth of its own depth slope (negative is farther with reversed-Z), so
     // wireframe lines along its edges still win at grazing angles, where the surface half a pixel nearer would
     // otherwise beat the line shader's constant 0.1% pull. WebGPU applies depth bias to triangles only.
@@ -726,11 +811,13 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         object_stride,
         lod_config: LodConfig::default(),
         tile_grid,
-        tile_meshes,
+        tile_layout,
+        albedo_sampler,
+        streaming: None,
+        inbox: Rc::new(RefCell::new(Vec::new())),
         visible_tiles: Vec::new(),
         marker,
         frame_index: 0,
-        faces,
         debug_flags: 0,
         camera: OrbitCamera::new(TYCHO_LAT_DEG, TYCHO_LON_DEG, 3.0 * MOON_RADIUS),
         _depth_texture: depth_texture,

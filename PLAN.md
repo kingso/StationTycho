@@ -90,10 +90,9 @@ Absolute positions (~1.7e6 m) in `f32` resolve only to about 0.2 m, which causes
 **Current implementation** (`crate/src/lod.rs`):
 - Tiles are 8×8-cell grids sharing one index buffer; each tile mesh is only its vertices, as offsets from its f64 centre.
 - Bounds: per-tile angular radius from its corners and edge midpoints, widened by the maximum terrain height (10.8 km) for both the frustum sphere and the horizon test.
-- $\epsilon$ = max(terrain `geometricError` per level from the v2 manifest, hard-coded until the engine reads the manifest; sag of the tile's flat grid cells). Split threshold 2 px, deepest level 7.
+- $\epsilon$ = max(terrain `geometricError` per level, read from the manifest; sag of the tile's flat grid cells). Split threshold 2 px, deepest level = the manifest's last level (7 in v2).
 - Priority refinement: always split the tile with the largest screen-space error; stop at the first split that would exceed the 1,024-tile budget, so a tight budget goes to the nearest terrain.
-- Readiness = mesh built. Missing children are returned as requests (most urgent first); the renderer builds at most 64 per frame and keeps an LRU of 4,096 tile meshes that never evicts roots or the visible tiles and their ancestors.
-- `feature/m4-tile-streaming` will make readiness mean "DEM and albedo loaded" and must account for levels 4–7 only existing around Tycho.
+- Readiness = the tile's DEM and albedo are resident on the GPU (§6). Pending children are returned as requests (most urgent first). A tile with a visible child that is unavailable (not in the manifest, 404, or failed for good) never splits, so refinement stops where the data does: level 3 away from Tycho, level 7 around it.
 
 ---
 
@@ -173,6 +172,14 @@ Versions: `v1` holds the synthetic M3 test tiles from `npm run tiles:test` (`til
 - **Fetching:** at most 6–8 requests in flight, priority = SSE × visibility, cancel requests that are no longer needed (`AbortController`).
 - **Errors:** a 404 or a failed decode marks the tile unavailable and keeps the parent visible.
 - **Picking:** keep downsampled height data on the CPU per loaded tile. Cast a ray from the camera against the sphere plus heights, convert the hit to lat/lon with `cube_to_latlon`.
+
+**Current implementation** (`crate/src/manifest.rs`, `crate/src/streaming.rs`, `crate/src/renderer.rs`):
+- The page fetches `v2/meta/manifest.json` first; it supplies tile availability and per-level geometric error. Nothing is drawn until it loads.
+- At most 4 tiles (8 requests: albedo + DEM) in flight, started in the selector's priority order. Each frame, loads the selection no longer requests are aborted; late results of aborted or superseded requests are ignored.
+- 404 or wrong size: unavailable for the session. Network/server error: retry after 1 s, then 2 s, then unavailable.
+- GPU budget 256 MiB ÷ 398,886 bytes per tile (257² RGBA8 albedo + 257² `u16` DEM + 81 vertices) = 672 slots. Each slot owns its textures, vertex buffer and bind group, and is reused after eviction, so GPU memory never exceeds the budget.
+- A load starts only if a slot will be free when it arrives (unused, or evictable). Least recently used tiles are evicted on demand; face roots and this frame's visible tiles and their ancestors never are. Data that arrives after its room has gone is dropped and re-requested later.
+- Each tile is textured from its own albedo and DEM; uv addresses the tile's texture, so `uv_scale_offset` is not needed while only ready tiles are drawn.
 
 ---
 
