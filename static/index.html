@@ -228,7 +228,8 @@
             }
             frames++;
             if (t - lastFpsUpdate >= 1000) {
-              status.textContent = `${base()} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())}`;
+              const lod = `Tiles ${renderer.visible_tile_count()} (L${renderer.finest_visible_level()}), cached ${renderer.cached_tile_count()}`;
+              status.textContent = `${base()} — ${Math.round((frames * 1000) / (t - lastFpsUpdate))} FPS — Alt ${formatAltitude(renderer.altitude())} — ${lod}`;
               frames = 0;
               lastFpsUpdate = t;
             }

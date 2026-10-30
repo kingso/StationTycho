@@ -23,7 +23,7 @@ pub fn enu_frame(lat: f64, lon: f64) -> (DVec3, DVec3, DVec3) {
 }
 
 /// Cube face, named by its outward axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Face {
     Px,
     Nx,
@@ -114,69 +114,75 @@ pub fn cube_to_latlon(face: Face, u: f64, v: f64) -> (f64, f64) {
     (s.z.atan2(s.x.hypot(s.y)), s.y.atan2(s.x))
 }
 
-/// Grid on part of the reference sphere, as f32 offsets from an f64 `origin`.
-pub struct ChunkMesh {
-    pub origin: DVec3,
-    /// Interleaved `[offset.xyz, normal.xyz, uv.xy]` per vertex; `uv` addresses the face's level-0 tile.
-    pub vertices: Vec<f32>,
-    pub triangles: Vec<u32>,
-    pub lines: Vec<u32>,
-}
-
 /// Texture coordinate of face coordinate `t` in `[-1, 1]`, landing on texel centres of a shared-border tile.
 pub fn face_to_tile_uv(t: f64) -> f64 {
     let last = (TILE_SIZE - 1) as f64;
     ((t + 1.0) * 0.5 * last + 0.5) / TILE_SIZE as f64
 }
 
-/// Splits `face` into `chunks × chunks` chunks of `segments × segments` cells each.
-pub fn face_chunks(face: Face, chunks: u32, segments: u32) -> Vec<ChunkMesh> {
+/// Face-coordinate bounds `(u0, u1, v0, v1)` of quadtree tile `(x, y)` at `level`.
+pub fn tile_face_bounds(level: u8, x: u32, y: u32) -> Option<(f64, f64, f64, f64)> {
+    let side = 1u32.checked_shl(u32::from(level))?;
+    if x >= side || y >= side {
+        return None;
+    }
+    let step = 2.0 / side as f64;
+    let (u0, v0) = (-1.0 + x as f64 * step, -1.0 + y as f64 * step);
+    Some((u0, u0 + step, v0, v0 + step))
+}
+
+/// Vertices of a `segments × segments` grid over a quadtree tile, as f32 offsets from the tile's f64 centre.
+/// Returns the centre and interleaved `[offset.xyz, normal.xyz, uv.xy]`; `uv` addresses the face's level-0 tile.
+pub fn tile_vertices(face: Face, level: u8, x: u32, y: u32, segments: u32) -> Option<(DVec3, Vec<f32>)> {
+    let (u0, u1, v0, v1) = tile_face_bounds(level, x, y)?;
+    if segments == 0 {
+        return None;
+    }
     let side = segments + 1;
-    let to_face = |c: u32, s: f64| -1.0 + 2.0 * (c as f64 + s) / chunks as f64;
-    let mut out = Vec::with_capacity((chunks * chunks) as usize);
-    for cj in 0..chunks {
-        for ci in 0..chunks {
-            let origin = cube_to_unit(face, to_face(ci, 0.5), to_face(cj, 0.5)) * MOON_RADIUS;
-            let mut vertices = Vec::with_capacity((side * side * 8) as usize);
-            for j in 0..side {
-                for i in 0..side {
-                    let u = to_face(ci, i as f64 / segments as f64);
-                    let v = to_face(cj, j as f64 / segments as f64);
-                    let s = cube_to_unit(face, u, v);
-                    let offset = (s * MOON_RADIUS - origin).as_vec3();
-                    let normal = s.as_vec3();
-                    vertices.extend_from_slice(&[
-                        offset.x,
-                        offset.y,
-                        offset.z,
-                        normal.x,
-                        normal.y,
-                        normal.z,
-                        face_to_tile_uv(u) as f32,
-                        face_to_tile_uv(v) as f32,
-                    ]);
-                }
-            }
-            let mut lines = Vec::with_capacity((4 * segments * side) as usize);
-            for a in 0..side {
-                for b in 0..segments {
-                    lines.extend_from_slice(&[a * side + b, a * side + b + 1]);
-                    lines.extend_from_slice(&[b * side + a, (b + 1) * side + a]);
-                }
-            }
-            // Counter-clockwise seen from outside, because u × v points outward.
-            let mut triangles = Vec::with_capacity((6 * segments * segments) as usize);
-            for j in 0..segments {
-                for i in 0..segments {
-                    let a = j * side + i;
-                    let (b, c, d) = (a + 1, a + side, a + side + 1);
-                    triangles.extend_from_slice(&[a, b, d, a, d, c]);
-                }
-            }
-            out.push(ChunkMesh { origin, vertices, triangles, lines });
+    let origin = cube_to_unit(face, (u0 + u1) * 0.5, (v0 + v1) * 0.5) * MOON_RADIUS;
+    let mut vertices = Vec::with_capacity((side * side * 8) as usize);
+    for j in 0..side {
+        for i in 0..side {
+            let u = u0 + (u1 - u0) * i as f64 / segments as f64;
+            let v = v0 + (v1 - v0) * j as f64 / segments as f64;
+            let s = cube_to_unit(face, u, v);
+            let offset = (s * MOON_RADIUS - origin).as_vec3();
+            let normal = s.as_vec3();
+            vertices.extend_from_slice(&[
+                offset.x,
+                offset.y,
+                offset.z,
+                normal.x,
+                normal.y,
+                normal.z,
+                face_to_tile_uv(u) as f32,
+                face_to_tile_uv(v) as f32,
+            ]);
         }
     }
-    out
+    Some((origin, vertices))
+}
+
+/// Triangle-list and line-list indices shared by every `segments × segments` tile grid from [`tile_vertices`].
+pub fn grid_indices(segments: u32) -> (Vec<u32>, Vec<u32>) {
+    let side = segments + 1;
+    // Counter-clockwise seen from outside, because u × v points outward.
+    let mut triangles = Vec::with_capacity((6 * segments * segments) as usize);
+    for j in 0..segments {
+        for i in 0..segments {
+            let a = j * side + i;
+            let (b, c, d) = (a + 1, a + side, a + side + 1);
+            triangles.extend_from_slice(&[a, b, d, a, d, c]);
+        }
+    }
+    let mut lines = Vec::with_capacity((4 * segments * side) as usize);
+    for a in 0..side {
+        for b in 0..segments {
+            lines.extend_from_slice(&[a * side + b, a * side + b + 1]);
+            lines.extend_from_slice(&[b * side + a, (b + 1) * side + a]);
+        }
+    }
+    (triangles, lines)
 }
 
 #[cfg(test)]
@@ -231,16 +237,19 @@ mod tests {
         assert_eq!(latlon_to_cube(std::f64::consts::FRAC_PI_2, 0.0).0, Face::Pz);
     }
 
+    fn vertex_positions(origin: DVec3, vertices: &[f32]) -> Vec<DVec3> {
+        vertices.chunks(8).map(|v| origin + DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64)).collect()
+    }
+
     #[test]
-    fn chunk_offsets_reconstruct_sphere_points() {
-        let chunks = face_chunks(Face::Py, 2, 4);
-        assert_eq!(chunks.len(), 4);
-        for chunk in &chunks {
-            assert_eq!(chunk.vertices.len(), 25 * 8);
-            assert_eq!(chunk.lines.len(), 2 * 2 * 4 * 5);
-            assert_eq!(chunk.triangles.len(), 6 * 4 * 4);
-            for v in chunk.vertices.chunks(8) {
-                let p = chunk.origin + DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64);
+    fn tile_offsets_reconstruct_sphere_points() {
+        let (triangles, lines) = grid_indices(4);
+        assert_eq!(triangles.len(), 6 * 4 * 4);
+        assert_eq!(lines.len(), 2 * 2 * 4 * 5);
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let (origin, vertices) = tile_vertices(Face::Py, 1, x, y, 4).unwrap();
+            assert_eq!(vertices.len(), 25 * 8);
+            for p in vertex_positions(origin, &vertices) {
                 assert!((p.length() - MOON_RADIUS).abs() < 0.1);
             }
         }
@@ -248,18 +257,39 @@ mod tests {
 
     #[test]
     fn triangles_face_outward() {
+        let (triangles, _) = grid_indices(2);
         for face in Face::ALL {
-            let chunk = &face_chunks(face, 1, 2)[0];
-            let pos = |i: u32| {
-                let v = &chunk.vertices[i as usize * 8..];
-                DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64)
-            };
-            for tri in chunk.triangles.chunks(3) {
-                let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
-                let outward = chunk.origin + (a + b + c) / 3.0;
-                assert!((b - a).cross(c - a).dot(outward) > 0.0, "{face:?}");
+            let (origin, vertices) = tile_vertices(face, 0, 0, 0, 2).unwrap();
+            let pos = vertex_positions(origin, &vertices);
+            for tri in triangles.chunks(3) {
+                let (a, b, c) = (pos[tri[0] as usize], pos[tri[1] as usize], pos[tri[2] as usize]);
+                assert!((b - a).cross(c - a).dot((a + b + c) / 3.0) > 0.0, "{face:?}");
             }
         }
+    }
+
+    #[test]
+    fn neighbouring_and_nested_tiles_share_vertices() {
+        const SEGMENTS: u32 = 8;
+        let side = SEGMENTS as usize + 1;
+        let grid = |level, x, y| {
+            let (origin, vertices) = tile_vertices(Face::Px, level, x, y, SEGMENTS).unwrap();
+            vertex_positions(origin, &vertices)
+        };
+        // Right edge of (2, 5) against left edge of (3, 5) at level 3.
+        let (left, right) = (grid(3, 2, 5), grid(3, 3, 5));
+        for j in 0..side {
+            assert!(left[j * side + SEGMENTS as usize].distance(right[j * side]) < 0.05);
+        }
+        // Child (4, 10) at level 4 starts at parent (2, 5)'s corner and matches its even vertices.
+        let (parent, child) = (grid(3, 2, 5), grid(4, 4, 10));
+        for j in (0..side).step_by(2) {
+            for i in (0..side).step_by(2) {
+                assert!(child[j * side + i].distance(parent[(j / 2) * side + i / 2]) < 0.05);
+            }
+        }
+        assert!(tile_vertices(Face::Px, 2, 4, 0, 8).is_none());
+        assert!(tile_vertices(Face::Px, 2, 0, 0, 0).is_none());
     }
 
     #[test]
