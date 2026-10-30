@@ -20,15 +20,16 @@ pub fn wrap_longitude_deg(lon: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{MOON_RADIUS, TYCHO_LAT_DEG, TYCHO_LON_DEG};
 
     #[test]
     fn default_sun_is_low_over_tycho() {
-        let tycho = latlon_to_unit((-43.31f64).to_radians(), (-11.36f64).to_radians());
+        let tycho = latlon_to_unit(TYCHO_LAT_DEG.to_radians(), TYCHO_LON_DEG.to_radians());
         let elevation = sun_direction(DEFAULT_SUBSOLAR_LON_DEG).dot(tycho).asin().to_degrees();
         assert!((12.0..18.0).contains(&elevation), "{elevation}");
         // The terminator is where the sun is on the horizon: 90° of longitude from the sub-solar point.
         let terminator_lon = DEFAULT_SUBSOLAR_LON_DEG + 90.0;
-        let km = (terminator_lon - -11.36) * 43.31f64.to_radians().cos() * crate::geometry::MOON_RADIUS.to_radians() / 1000.0;
+        let km = (terminator_lon - TYCHO_LON_DEG) * TYCHO_LAT_DEG.to_radians().cos() * MOON_RADIUS.to_radians() / 1000.0;
         assert!((440.0..500.0).contains(&km), "{km}");
     }
 

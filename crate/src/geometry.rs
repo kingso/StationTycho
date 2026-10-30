@@ -3,6 +3,11 @@ use glam::DVec3;
 /// IAU reference sphere radius of the Moon, in metres.
 pub const MOON_RADIUS: f64 = 1_737_400.0;
 
+/// Centre of Tycho in degrees, from the IAU/USGS Gazetteer of Planetary Nomenclature (feature 6163:
+/// 43.2958°S, 348.7847°E).
+pub const TYCHO_LAT_DEG: f64 = -43.2958;
+pub const TYCHO_LON_DEG: f64 = 348.7847 - 360.0;
+
 /// Unit vector in the Moon ME body-fixed frame for `lat`/`lon` in radians.
 pub fn latlon_to_unit(lat: f64, lon: f64) -> DVec3 {
     let (sin_lat, cos_lat) = lat.sin_cos();
