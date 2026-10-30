@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::camera::OrbitCamera;
-use crate::geometry::{enu_frame, grid_indices, tile_vertices, Face, MOON_RADIUS};
-use crate::lod::{select_tiles, LodConfig, TileId, MAX_VISIBLE_TILES, TILE_SEGMENTS};
-use crate::manifest::Manifest;
+use crate::geometry::{enu_frame, grid_attributes, grid_indices, grid_vertex_count, tile_vertices, Face, MOON_RADIUS};
+use crate::lod::{select_tiles, skirt_depths, LodConfig, TileId, MAX_VISIBLE_TILES, TILE_SEGMENTS};
+use crate::manifest::{DemQuantization, Manifest};
 use crate::streaming::{
     tile_gpu_bytes, Completion, FetchResult, TileCache, GPU_TILE_BUDGET_BYTES, MAX_IN_FLIGHT_TILES,
 };
@@ -22,10 +22,15 @@ const WIREFRAME_SHADER: &str = include_str!("shaders/wireframe.wgsl");
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const FRAME_UNIFORM_SIZE: u64 = 80;
-const OBJECT_UNIFORM_SIZE: u64 = 32;
-const VERTEX_STRIDE: u64 = 32;
+const OBJECT_UNIFORM_SIZE: u64 = 48;
+/// Marker vertices: `[offset.xyz, normal.xyz, uv.xy]`.
+const MARKER_VERTEX_STRIDE: u64 = 32;
+/// Tile vertices: an f32 offset from the tile centre (buffer 0), plus shared `[u, v, skirt]` (buffer 1).
+const TILE_VERTEX_STRIDE: u64 = 12;
 
 const DEBUG_WIREFRAME: u32 = 1;
+/// Clears to magenta instead of black, so any crack in the terrain stands out.
+const DEBUG_CRACKS: u32 = 4;
 
 const ALBEDO_BYTES: usize = (TILE_SIZE * TILE_SIZE * 4) as usize;
 const DEM_BYTES: usize = (TILE_SIZE * TILE_SIZE * 2) as usize;
@@ -87,6 +92,8 @@ struct TileGrid {
     triangle_count: u32,
     lines: wgpu::Buffer,
     line_count: u32,
+    /// `[u, v, skirt]` per vertex, the second vertex buffer of every tile.
+    attributes: wgpu::Buffer,
 }
 
 impl TileGrid {
@@ -97,6 +104,11 @@ impl TileGrid {
             triangle_count: triangles.len() as u32,
             lines: index_buffer(device, "Tile Grid Lines", &lines),
             line_count: lines.len() as u32,
+            attributes: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Tile Grid Attributes"),
+                contents: &f32_bytes(&grid_attributes(TILE_SEGMENTS)),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
         }
     }
 }
@@ -117,7 +129,7 @@ impl TileSlot {
         let dem = create_tile_texture(device, "Tile DEM", wgpu::TextureFormat::R16Uint);
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Tile Vertices"),
-            size: VERTEX_STRIDE * u64::from((TILE_SEGMENTS + 1) * (TILE_SEGMENTS + 1)),
+            size: TILE_VERTEX_STRIDE * u64::from(grid_vertex_count(TILE_SEGMENTS)),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -189,11 +201,13 @@ fn tycho_marker(device: &wgpu::Device) -> Mesh {
     Mesh::new(device, "Tycho Marker", up * MOON_RADIUS, &vertices, &indices, [1.0, 0.45, 0.2, 1.0])
 }
 
-/// Per-object uniform: origin relative to the camera, then the wireframe colour.
-fn object_uniform(origin: DVec3, color: [f32; 4], camera_position: DVec3) -> Vec<u8> {
+/// Per-object uniform: origin relative to the camera with the skirt depth, the wireframe colour, then the origin
+/// itself (only used for directions).
+fn object_uniform(origin: DVec3, skirt_depth: f64, color: [f32; 4], camera_position: DVec3) -> Vec<u8> {
     let rel = (origin - camera_position).as_vec3();
+    let center = origin.as_vec3();
     let [r, g, b, a] = color;
-    f32_bytes(&[rel.x, rel.y, rel.z, 0.0, r, g, b, a])
+    f32_bytes(&[rel.x, rel.y, rel.z, skirt_depth as f32, r, g, b, a, center.x, center.y, center.z, 0.0])
 }
 
 fn create_tile_texture(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat) -> wgpu::Texture {
@@ -313,6 +327,8 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     terrain_pipeline: wgpu::RenderPipeline,
+    terrain_under_wire_pipeline: wgpu::RenderPipeline,
+    tile_wire_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     frame_buffer: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
@@ -320,6 +336,7 @@ pub struct Renderer {
     object_bind_group: wgpu::BindGroup,
     object_stride: u64,
     lod_config: LodConfig,
+    dem: DemQuantization,
     tile_grid: TileGrid,
     tile_layout: wgpu::BindGroupLayout,
     albedo_sampler: wgpu::Sampler,
@@ -373,7 +390,8 @@ impl Renderer {
         self.camera.altitude()
     }
 
-    /// Bit 0 draws the wireframe over the terrain; bit 1 shows heights instead of albedo.
+    /// Bit 0 draws the wireframe over the terrain; bit 1 shows heights instead of albedo; bit 2 clears to magenta
+    /// so cracks stand out; bit 3 turns skirts off.
     pub fn set_debug_flags(&mut self, flags: u32) {
         self.debug_flags = flags;
     }
@@ -424,6 +442,7 @@ impl Renderer {
         if let Some(old) = self.streaming.take() {
             old.requests.values().for_each(web_sys::AbortController::abort);
         }
+        self.dem = manifest.dem;
         self.lod_config = LodConfig {
             max_level: manifest.max_level(),
             terrain_error_m: manifest.geometric_error_m.clone(),
@@ -445,13 +464,15 @@ impl Renderer {
         if self.visible_tiles.len() > MAX_VISIBLE_TILES {
             return Err(JsValue::from_str(&format!("{} tiles exceed the {MAX_VISIBLE_TILES}-tile buffer", self.visible_tiles.len())));
         }
-        let drawn: Vec<(&TileSlot, [f32; 4])> = match &self.streaming {
+        let skirts = skirt_depths(&self.visible_tiles, &self.lod_config);
+        let drawn: Vec<(&TileSlot, f64, [f32; 4])> = match &self.streaming {
             Some(streaming) => self
                 .visible_tiles
                 .iter()
-                .map(|tile| {
+                .zip(skirts)
+                .map(|(tile, skirt)| {
                     let slot = streaming.cache.slot(*tile).expect("selected tiles are resident");
-                    (&streaming.slots[slot], face_color(tile.face))
+                    (&streaming.slots[slot], skirt, face_color(tile.face))
                 })
                 .collect(),
             None => Vec::new(),
@@ -459,7 +480,8 @@ impl Renderer {
 
         let view_proj = self.camera.view_proj(aspect);
         let mut frame_data = f32_bytes(&view_proj.to_cols_array());
-        frame_data.extend_from_slice(&u32_bytes(&[self.debug_flags, 0, 0, 0]));
+        frame_data.extend_from_slice(&u32_bytes(&[self.debug_flags]));
+        frame_data.extend_from_slice(&f32_bytes(&[self.dem.scale as f32, self.dem.offset as f32, 0.0]));
         self.queue.write_buffer(&self.frame_buffer, 0, &frame_data);
 
         // Visible tiles take the first uniform slots and the marker the last.
@@ -467,12 +489,12 @@ impl Renderer {
         let stride = self.object_stride as usize;
         let visible_count = drawn.len();
         let mut objects = vec![0u8; stride * (visible_count + 1)];
-        for (i, (slot, color)) in drawn.iter().enumerate() {
+        for (i, (slot, skirt, color)) in drawn.iter().enumerate() {
             objects[i * stride..i * stride + OBJECT_UNIFORM_SIZE as usize]
-                .copy_from_slice(&object_uniform(slot.origin, *color, camera_pos));
+                .copy_from_slice(&object_uniform(slot.origin, *skirt, *color, camera_pos));
         }
         objects[visible_count * stride..visible_count * stride + OBJECT_UNIFORM_SIZE as usize]
-            .copy_from_slice(&object_uniform(self.marker.origin, self.marker.color, camera_pos));
+            .copy_from_slice(&object_uniform(self.marker.origin, 0.0, self.marker.color, camera_pos));
         self.queue.write_buffer(&self.object_buffer, 0, &objects);
 
         let frame = match self.surface.get_current_texture() {
@@ -498,7 +520,10 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(match self.debug_flags & DEBUG_CRACKS {
+                            0 => wgpu::Color::BLACK,
+                            _ => wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 },
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -516,24 +541,28 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
 
-            pass.set_pipeline(&self.terrain_pipeline);
+            let show_wireframe = self.debug_flags & DEBUG_WIREFRAME != 0;
+            pass.set_pipeline(if show_wireframe { &self.terrain_under_wire_pipeline } else { &self.terrain_pipeline });
+            pass.set_vertex_buffer(1, self.tile_grid.attributes.slice(..));
             pass.set_index_buffer(self.tile_grid.triangles.slice(..), wgpu::IndexFormat::Uint32);
-            for (i, (slot, _)) in drawn.iter().enumerate() {
+            for (i, (slot, _, _)) in drawn.iter().enumerate() {
                 pass.set_bind_group(1, &self.object_bind_group, &[(i as u64 * self.object_stride) as u32]);
                 pass.set_bind_group(2, &slot.bind_group, &[]);
                 pass.set_vertex_buffer(0, slot.vertex_buffer.slice(..));
                 pass.draw_indexed(0..self.tile_grid.triangle_count, 0, 0..1);
             }
 
-            pass.set_pipeline(&self.line_pipeline);
-            if self.debug_flags & DEBUG_WIREFRAME != 0 {
+            if show_wireframe {
+                pass.set_pipeline(&self.tile_wire_pipeline);
                 pass.set_index_buffer(self.tile_grid.lines.slice(..), wgpu::IndexFormat::Uint32);
-                for (i, (slot, _)) in drawn.iter().enumerate() {
+                for (i, (slot, _, _)) in drawn.iter().enumerate() {
                     pass.set_bind_group(1, &self.object_bind_group, &[(i as u64 * self.object_stride) as u32]);
+                    pass.set_bind_group(2, &slot.bind_group, &[]);
                     pass.set_vertex_buffer(0, slot.vertex_buffer.slice(..));
                     pass.draw_indexed(0..self.tile_grid.line_count, 0, 0..1);
                 }
             }
+            pass.set_pipeline(&self.line_pipeline);
             pass.set_bind_group(1, &self.object_bind_group, &[(visible_count as u64 * self.object_stride) as u32]);
             pass.set_vertex_buffer(0, self.marker.vertex_buffer.slice(..));
             pass.set_index_buffer(self.marker.line_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -768,28 +797,62 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    // Push the surface back by one pixel's worth of its own depth slope (negative is farther with reversed-Z), so
-    // wireframe lines along its edges still win at grazing angles, where the surface half a pixel nearer would
-    // otherwise beat the line shader's constant 0.1% pull. WebGPU applies depth bias to triangles only.
-    let terrain_bias = wgpu::DepthBiasState { constant: 0, slope_scale: -1.0, clamp: 0.0 };
-    let terrain_pipeline = create_pipeline(
+    // With the wireframe on, the surface is pushed back by one pixel's worth of its own depth slope (negative is
+    // farther with reversed-Z), so lines along its edges still win at grazing angles, where the surface half a pixel
+    // nearer would otherwise beat the line shader's constant 0.1% pull. WebGPU applies depth bias to triangles only.
+    // It is not used otherwise: on near-vertical skirts the bias can exceed the depth itself, which clamps to the
+    // far plane and leaves pinholes.
+    let wireframe_bias = wgpu::DepthBiasState { constant: 0, slope_scale: -1.0, clamp: 0.0 };
+    let tile_buffers = [
+        Some(wgpu::VertexBufferLayout {
+            array_stride: TILE_VERTEX_STRIDE,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+        }),
+        Some(wgpu::VertexBufferLayout {
+            array_stride: TILE_VERTEX_STRIDE,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![1 => Float32x3],
+        }),
+    ];
+    let marker_buffers = [Some(wgpu::VertexBufferLayout {
+        array_stride: MARKER_VERTEX_STRIDE,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+    })];
+    let line_list = wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() };
+    let terrain = |label, bias| {
+        create_pipeline(
+            &device,
+            label,
+            (&terrain_shader, "vs_main", "fs_main"),
+            &tile_buffers,
+            &terrain_layout,
+            surface_format,
+            wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+            bias,
+        )
+    };
+    let terrain_pipeline = terrain("Terrain Pipeline", wgpu::DepthBiasState::default());
+    let terrain_under_wire_pipeline = terrain("Terrain Under Wireframe Pipeline", wireframe_bias);
+    let tile_wire_pipeline = create_pipeline(
         &device,
-        "Terrain Pipeline",
-        &terrain_shader,
+        "Tile Wireframe Pipeline",
+        (&terrain_shader, "vs_wire", "fs_wire"),
+        &tile_buffers,
         &terrain_layout,
         surface_format,
-        wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
-        wgpu::CompareFunction::Greater,
-        terrain_bias,
+        line_list,
+        wgpu::DepthBiasState::default(),
     );
     let line_pipeline = create_pipeline(
         &device,
-        "Wireframe Pipeline",
-        &line_shader,
+        "Marker Pipeline",
+        (&line_shader, "vs_main", "fs_main"),
+        &marker_buffers,
         &pipeline_layout,
         surface_format,
-        wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
-        wgpu::CompareFunction::Greater,
+        line_list,
         wgpu::DepthBiasState::default(),
     );
 
@@ -803,6 +866,8 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         queue,
         config,
         terrain_pipeline,
+        terrain_under_wire_pipeline,
+        tile_wire_pipeline,
         line_pipeline,
         frame_buffer,
         frame_bind_group,
@@ -810,6 +875,7 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
         object_bind_group,
         object_stride,
         lod_config: LodConfig::default(),
+        dem: DemQuantization { scale: 1.0, offset: 0.0 },
         tile_grid,
         tile_layout,
         albedo_sampler,
@@ -825,14 +891,16 @@ pub async fn init_render_engine(canvas_id: &str, width: u32, height: u32) -> Res
     })
 }
 
+/// Depth-tested pipeline (reversed-Z: nearer is greater) drawing into the surface format.
+#[allow(clippy::too_many_arguments)]
 fn create_pipeline(
     device: &wgpu::Device,
     label: &str,
-    shader: &wgpu::ShaderModule,
+    (shader, vertex_entry, fragment_entry): (&wgpu::ShaderModule, &str, &str),
+    buffers: &[Option<wgpu::VertexBufferLayout>],
     layout: &wgpu::PipelineLayout,
     format: wgpu::TextureFormat,
     primitive: wgpu::PrimitiveState,
-    depth_compare: wgpu::CompareFunction,
     bias: wgpu::DepthBiasState,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -840,17 +908,13 @@ fn create_pipeline(
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: VERTEX_STRIDE,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
-            })],
+            entry_point: Some(vertex_entry),
+            buffers,
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment_entry),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: Some(wgpu::BlendState::REPLACE),
@@ -862,7 +926,7 @@ fn create_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(true),
-            depth_compare: Some(depth_compare),
+            depth_compare: Some(wgpu::CompareFunction::Greater),
             stencil: wgpu::StencilState::default(),
             bias,
         }),

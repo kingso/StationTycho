@@ -11,7 +11,15 @@ use crate::tiles::{DATASET_VERSION, TILE_SIZE};
 struct RawManifest {
     version: String,
     tile_size: u32,
+    dem: DemQuantization,
     levels: Vec<RawLevel>,
+}
+
+/// Height in metres = `u16` DEM value × `scale` + `offset`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+pub struct DemQuantization {
+    pub scale: f64,
+    pub offset: f64,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +36,7 @@ struct RawLevel {
 pub struct Manifest {
     /// Terrain geometric error in metres, indexed by level.
     pub geometric_error_m: Vec<f64>,
+    pub dem: DemQuantization,
     available: HashSet<TileId>,
 }
 
@@ -54,7 +63,10 @@ impl Manifest {
         if let Some(face) = Face::ALL.into_iter().find(|&face| !available.contains(&TileId::root(face))) {
             return Err(format!("manifest has no level-0 tile for {}", face.key()));
         }
-        Ok(Self { geometric_error_m, available })
+        if !(raw.dem.scale > 0.0) {
+            return Err(format!("manifest DEM scale {} is not positive", raw.dem.scale));
+        }
+        Ok(Self { geometric_error_m, dem: raw.dem, available })
     }
 
     pub fn contains(&self, tile: TileId) -> bool {
@@ -88,7 +100,7 @@ mod tests {
     const ROOTS: &str = r#"["px",0,0,-1,1], ["nx",0,0,-1,1], ["py",0,0,-1,1], ["ny",0,0,-1,1], ["pz",0,0,-1,1], ["nz",0,0,-1,1]"#;
 
     fn manifest(version: &str, levels: &str) -> String {
-        format!(r#"{{"version": "{version}", "tileSize": 257, "dem": {{"scale": 0.5}}, "levels": [{levels}]}}"#)
+        format!(r#"{{"version": "{version}", "tileSize": 257, "dem": {{"scale": 0.5, "offset": -9200}}, "levels": [{levels}]}}"#)
     }
 
     #[test]
@@ -102,6 +114,7 @@ mod tests {
         );
         let m = Manifest::parse(&json).unwrap();
         assert_eq!(m.geometric_error_m, [6826.5, 3634.3]);
+        assert_eq!(m.dem, DemQuantization { scale: 0.5, offset: -9200.0 });
         assert_eq!(m.max_level(), 1);
         assert_eq!(m.tile_count(), 8);
         assert!(m.contains(TileId { face: Face::Px, level: 1, x: 1, y: 0 }));
@@ -126,6 +139,10 @@ mod tests {
         assert!(Manifest::parse(&bad(r#""px 0 0 0 0""#)).is_err());
         assert!(Manifest::parse(&manifest("v2", r#"{"level": 1, "geometricError": 1, "tiles": []}"#)).is_err());
         assert!(Manifest::parse("not json").is_err());
+        let no_dem = manifest("v2", &roots).replace(r#""dem": {"scale": 0.5, "offset": -9200}, "#, "");
+        assert!(Manifest::parse(&no_dem).unwrap_err().contains("dem"));
+        let flat = manifest("v2", &roots).replace(r#""scale": 0.5"#, r#""scale": 0"#);
+        assert!(Manifest::parse(&flat).unwrap_err().contains("scale"));
     }
 
     /// The manifest the pipeline built, when present (it lives in the git-ignored `data/`).
@@ -135,6 +152,7 @@ mod tests {
         let Ok(json) = std::fs::read_to_string(path) else { return };
         let m = Manifest::parse(&json).unwrap();
         assert_eq!(m.max_level(), 7);
+        assert_eq!(m.dem, DemQuantization { scale: 0.5, offset: -9200.0 });
         assert_eq!(m.tile_count(), 6 + 24 + 96 + 384 + 16 + 16 + 48 + 124);
     }
 }

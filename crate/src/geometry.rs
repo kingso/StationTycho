@@ -1,7 +1,5 @@
 use glam::DVec3;
 
-use crate::tiles::TILE_SIZE;
-
 /// IAU reference sphere radius of the Moon, in metres.
 pub const MOON_RADIUS: f64 = 1_737_400.0;
 
@@ -119,12 +117,6 @@ pub fn cube_to_latlon(face: Face, u: f64, v: f64) -> (f64, f64) {
     (s.z.atan2(s.x.hypot(s.y)), s.y.atan2(s.x))
 }
 
-/// Texture coordinate of tile-local coordinate `t` in `[-1, 1]`, landing on texel centres of a shared-border tile.
-pub fn face_to_tile_uv(t: f64) -> f64 {
-    let last = (TILE_SIZE - 1) as f64;
-    ((t + 1.0) * 0.5 * last + 0.5) / TILE_SIZE as f64
-}
-
 /// Face-coordinate bounds `(u0, u1, v0, v1)` of quadtree tile `(x, y)` at `level`.
 pub fn tile_face_bounds(level: u8, x: u32, y: u32) -> Option<(f64, f64, f64, f64)> {
     let side = 1u32.checked_shl(u32::from(level))?;
@@ -136,8 +128,20 @@ pub fn tile_face_bounds(level: u8, x: u32, y: u32) -> Option<(f64, f64, f64, f64
     Some((u0, u0 + step, v0, v0 + step))
 }
 
-/// Vertices of a `segments × segments` grid over a quadtree tile, as f32 offsets from the tile's f64 centre.
-/// Returns the centre and interleaved `[offset.xyz, normal.xyz, uv.xy]`; `uv` addresses the tile's own texture.
+/// Number of vertices in a tile grid: `(segments + 1)²` grid vertices, then a skirt ring of `4 · segments`.
+pub fn grid_vertex_count(segments: u32) -> u32 {
+    (segments + 1) * (segments + 1) + 4 * segments
+}
+
+/// Grid `(i, j)` of each skirt-ring vertex: once around the tile edge, counter-clockwise seen from outside.
+fn skirt_ring(segments: u32) -> impl Iterator<Item = (u32, u32)> {
+    let s = segments;
+    (0..s).map(|i| (i, 0)).chain((0..s).map(move |j| (s, j))).chain((0..s).map(move |i| (s - i, s))).chain((0..s).map(move |j| (0, s - j)))
+}
+
+/// Vertices of a `segments × segments` grid over a quadtree tile, as f32 offsets `[x, y, z]` from the tile's f64
+/// centre on the reference sphere, followed by the skirt ring (duplicates of the edge vertices). Returns the
+/// centre and the offsets; the shader adds heights along the sphere normal.
 pub fn tile_vertices(face: Face, level: u8, x: u32, y: u32, segments: u32) -> Option<(DVec3, Vec<f32>)> {
     let (u0, u1, v0, v1) = tile_face_bounds(level, x, y)?;
     if segments == 0 {
@@ -145,39 +149,48 @@ pub fn tile_vertices(face: Face, level: u8, x: u32, y: u32, segments: u32) -> Op
     }
     let side = segments + 1;
     let origin = cube_to_unit(face, (u0 + u1) * 0.5, (v0 + v1) * 0.5) * MOON_RADIUS;
-    let mut vertices = Vec::with_capacity((side * side * 8) as usize);
-    for j in 0..side {
-        for i in 0..side {
-            let (s_i, s_j) = (i as f64 / segments as f64, j as f64 / segments as f64);
-            let s = cube_to_unit(face, u0 + (u1 - u0) * s_i, v0 + (v1 - v0) * s_j);
-            let offset = (s * MOON_RADIUS - origin).as_vec3();
-            let normal = s.as_vec3();
-            vertices.extend_from_slice(&[
-                offset.x,
-                offset.y,
-                offset.z,
-                normal.x,
-                normal.y,
-                normal.z,
-                face_to_tile_uv(2.0 * s_i - 1.0) as f32,
-                face_to_tile_uv(2.0 * s_j - 1.0) as f32,
-            ]);
-        }
+    let offset = |i: u32, j: u32| {
+        let (s_i, s_j) = (i as f64 / segments as f64, j as f64 / segments as f64);
+        (cube_to_unit(face, u0 + (u1 - u0) * s_i, v0 + (v1 - v0) * s_j) * MOON_RADIUS - origin).as_vec3()
+    };
+    let mut vertices = Vec::with_capacity(grid_vertex_count(segments) as usize * 3);
+    let grid = (0..side).flat_map(|j| (0..side).map(move |i| (i, j)));
+    for (i, j) in grid.chain(skirt_ring(segments)) {
+        vertices.extend_from_slice(&offset(i, j).to_array());
     }
     Some((origin, vertices))
 }
 
-/// Triangle-list and line-list indices shared by every `segments × segments` tile grid from [`tile_vertices`].
+/// Per-vertex `[u, v, skirt]` shared by every tile grid: `u`, `v` in `[0, 1]` across the tile (`(u, v) · 256` is
+/// the vertex's DEM texel when `segments` divides 256), and `skirt` is 1 on the skirt ring.
+pub fn grid_attributes(segments: u32) -> Vec<f32> {
+    let side = segments + 1;
+    let t = |n: u32| n as f32 / segments as f32;
+    let grid = (0..side).flat_map(|j| (0..side).map(move |i| [t(i), t(j), 0.0]));
+    let skirt = skirt_ring(segments).map(|(i, j)| [t(i), t(j), 1.0]);
+    grid.chain(skirt).flatten().collect()
+}
+
+/// Triangle-list indices (grid, then skirt walls) and line-list indices (grid only) shared by every tile.
 pub fn grid_indices(segments: u32) -> (Vec<u32>, Vec<u32>) {
     let side = segments + 1;
     // Counter-clockwise seen from outside, because u × v points outward.
-    let mut triangles = Vec::with_capacity((6 * segments * segments) as usize);
+    let mut triangles = Vec::with_capacity((6 * segments * segments + 24 * segments) as usize);
     for j in 0..segments {
         for i in 0..segments {
             let a = j * side + i;
             let (b, c, d) = (a + 1, a + side, a + side + 1);
             triangles.extend_from_slice(&[a, b, d, a, d, c]);
         }
+    }
+    // Each wall hangs from edge vertices a -> b down to their skirt copies c -> d, facing away from the tile.
+    let ring: Vec<_> = skirt_ring(segments).map(|(i, j)| j * side + i).collect();
+    let first_skirt = side * side;
+    for k in 0..ring.len() {
+        let next = (k + 1) % ring.len();
+        let (a, b) = (ring[k], ring[next]);
+        let (c, d) = (first_skirt + k as u32, first_skirt + next as u32);
+        triangles.extend_from_slice(&[a, c, b, b, c, d]);
     }
     let mut lines = Vec::with_capacity((4 * segments * side) as usize);
     for a in 0..side {
@@ -242,17 +255,19 @@ mod tests {
     }
 
     fn vertex_positions(origin: DVec3, vertices: &[f32]) -> Vec<DVec3> {
-        vertices.chunks(8).map(|v| origin + DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64)).collect()
+        vertices.chunks(3).map(|v| origin + DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64)).collect()
     }
 
     #[test]
     fn tile_offsets_reconstruct_sphere_points() {
         let (triangles, lines) = grid_indices(4);
-        assert_eq!(triangles.len(), 6 * 4 * 4);
+        assert_eq!(grid_vertex_count(4), 25 + 16);
+        assert_eq!(triangles.len(), 6 * 4 * 4 + 6 * 16);
         assert_eq!(lines.len(), 2 * 2 * 4 * 5);
+        assert!(triangles.iter().chain(&lines).all(|&i| i < grid_vertex_count(4)));
         for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
             let (origin, vertices) = tile_vertices(Face::Py, 1, x, y, 4).unwrap();
-            assert_eq!(vertices.len(), 25 * 8);
+            assert_eq!(vertices.len(), 41 * 3);
             for p in vertex_positions(origin, &vertices) {
                 assert!((p.length() - MOON_RADIUS).abs() < 0.1);
             }
@@ -260,14 +275,47 @@ mod tests {
     }
 
     #[test]
-    fn triangles_face_outward() {
-        let (triangles, _) = grid_indices(2);
+    fn skirt_ring_duplicates_the_edge_and_is_flagged() {
+        const S: u32 = 8;
+        let side = S as usize + 1;
+        let (origin, vertices) = tile_vertices(Face::Nz, 3, 2, 5, S).unwrap();
+        let attributes = grid_attributes(S);
+        assert_eq!(attributes.len(), grid_vertex_count(S) as usize * 3);
+        let positions = vertex_positions(origin, &vertices);
+        let attrs: Vec<_> = attributes.chunks(3).collect();
+        for (k, (i, j)) in skirt_ring(S).enumerate() {
+            let (skirt, edge) = (side * side + k, j as usize * side + i as usize);
+            assert!(i == 0 || i == S || j == 0 || j == S);
+            assert_eq!(positions[skirt], positions[edge]);
+            assert_eq!((attrs[skirt][0], attrs[skirt][1], attrs[skirt][2]), (attrs[edge][0], attrs[edge][1], 1.0));
+        }
+        assert!(attrs[..side * side].iter().all(|a| a[2] == 0.0));
+        // Grid vertices land on every 32nd texel of the 257-texel tile, the edges on texels 0 and 256.
+        assert_eq!((attrs[0][0] * 256.0, attrs[side - 1][0] * 256.0, attrs[1][0] * 256.0), (0.0, 256.0, 32.0));
+    }
+
+    #[test]
+    fn triangles_face_outward_and_skirts_face_away_from_the_tile() {
+        const S: u32 = 2;
+        let (triangles, _) = grid_indices(S);
+        let grid_triangles = (6 * S * S) as usize;
         for face in Face::ALL {
-            let (origin, vertices) = tile_vertices(face, 0, 0, 0, 2).unwrap();
-            let pos = vertex_positions(origin, &vertices);
-            for tri in triangles.chunks(3) {
+            let (origin, vertices) = tile_vertices(face, 1, 1, 0, S).unwrap();
+            let mut pos = vertex_positions(origin, &vertices);
+            // Lower the skirt ring as the shader does.
+            for p in pos.iter_mut().skip(((S + 1) * (S + 1)) as usize) {
+                *p -= p.normalize() * 1000.0;
+            }
+            for (n, tri) in triangles.chunks(3).enumerate() {
                 let (a, b, c) = (pos[tri[0] as usize], pos[tri[1] as usize], pos[tri[2] as usize]);
-                assert!((b - a).cross(c - a).dot((a + b + c) / 3.0) > 0.0, "{face:?}");
+                let normal = (b - a).cross(c - a);
+                let centroid = (a + b + c) / 3.0;
+                if n * 3 < grid_triangles {
+                    assert!(normal.dot(centroid) > 0.0, "{face:?} grid triangle {n}");
+                } else {
+                    let away = centroid - origin - origin.normalize() * (centroid - origin).dot(origin.normalize());
+                    assert!(normal.dot(away) > 0.0, "{face:?} skirt triangle {n}");
+                }
             }
         }
     }
@@ -294,12 +342,5 @@ mod tests {
         }
         assert!(tile_vertices(Face::Px, 2, 4, 0, 8).is_none());
         assert!(tile_vertices(Face::Px, 2, 0, 0, 0).is_none());
-    }
-
-    #[test]
-    fn tile_uv_hits_edge_texel_centres() {
-        let half_texel = 0.5 / TILE_SIZE as f64;
-        assert!((face_to_tile_uv(-1.0) - half_texel).abs() < 1e-12);
-        assert!((face_to_tile_uv(1.0) - (1.0 - half_texel)).abs() < 1e-12);
     }
 }

@@ -1,13 +1,17 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use glam::DVec3;
 
 use crate::camera::OrbitCamera;
-use crate::geometry::{cube_to_unit, tile_face_bounds, Face, MOON_RADIUS};
+use crate::geometry::{cube_to_unit, tile_face_bounds, unit_to_cube, Face, MOON_RADIUS};
+use crate::tiles::TILE_SIZE;
 
-/// Grid cells along each tile edge; every tile is drawn as `TILE_SEGMENTS × TILE_SEGMENTS` quads.
-pub const TILE_SEGMENTS: u32 = 8;
+/// Grid cells along each tile edge; every tile is drawn as `TILE_SEGMENTS × TILE_SEGMENTS` quads (PLAN.md §3.4).
+pub const TILE_SEGMENTS: u32 = 64;
+/// The grid takes every `2^GRID_LEVEL_SHIFT`-th DEM texel, so its vertex spacing is that of the full-resolution
+/// grid `GRID_LEVEL_SHIFT` levels up.
+const GRID_LEVEL_SHIFT: i32 = ((TILE_SIZE - 1) / TILE_SEGMENTS).trailing_zeros() as i32;
 /// Most tiles drawn in one frame; sizes the per-tile uniform buffer.
 pub const MAX_VISIBLE_TILES: usize = 1024;
 /// Highest terrain above the reference sphere: the top of the `u16` DEM range (PLAN.md §4.2).
@@ -18,7 +22,7 @@ const MAX_LEVEL_LIMIT: u8 = 24;
 const V2_TERRAIN_ERROR_M: [f64; 8] = [6826.5, 3634.3, 2034.0, 991.8, 631.4, 423.9, 312.4, 104.1];
 /// Largest grid-cell half-diagonal relative to `angular_radius / TILE_SEGMENTS`, because the cube-to-sphere
 /// mapping makes cells uneven. Checked by `mesh_error_bounds_every_cell`.
-const CELL_SIZE_MARGIN: f64 = 1.25;
+const CELL_SIZE_MARGIN: f64 = 1.3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TileId {
@@ -165,7 +169,9 @@ pub struct LodConfig {
     pub max_level: u8,
     pub screen_space_error_px: f64,
     pub max_visible_tiles: usize,
-    /// Terrain geometric error per level in metres; deeper levels halve the last entry per level.
+    /// Terrain geometric error in metres of each level's full-resolution grid against the finest data
+    /// (`levels[].geometricError` of the manifest). Deeper levels halve the last entry per level; coarser ones
+    /// double the first.
     pub terrain_error_m: Vec<f64>,
 }
 
@@ -181,13 +187,22 @@ impl Default for LodConfig {
 }
 
 impl LodConfig {
-    fn terrain_error(&self, level: u8) -> f64 {
-        let levels = self.terrain_error_m.len();
-        match (self.terrain_error_m.get(level as usize), self.terrain_error_m.last()) {
-            (Some(&error), _) => error,
-            (None, Some(&last)) => last * 0.5f64.powi(level as i32 + 1 - levels as i32),
-            (None, None) => 0.0,
+    fn terrain_error(&self, level: i32) -> f64 {
+        let (Some(&first), Some(&last)) = (self.terrain_error_m.first(), self.terrain_error_m.last()) else {
+            return 0.0;
+        };
+        let levels = self.terrain_error_m.len() as i32;
+        match level {
+            l if l < 0 => first * 2f64.powi(-l),
+            l if l < levels => self.terrain_error_m[l as usize],
+            l => last * 0.5f64.powi(l + 1 - levels),
         }
+    }
+
+    /// Terrain error of a level-`level` tile as drawn: its grid has the vertex spacing of the full-resolution grid
+    /// `GRID_LEVEL_SHIFT` levels up, so it has that level's error.
+    pub fn drawn_error(&self, level: u8) -> f64 {
+        self.terrain_error(i32::from(level) - GRID_LEVEL_SHIFT)
     }
 }
 
@@ -249,7 +264,7 @@ struct Selector<'a> {
 impl Selector<'_> {
     /// Selects `tile` and queues it for splitting if it is too coarse for the view.
     fn select(&mut self, tile: TileId, bounds: &TileBounds) {
-        let error = self.config.terrain_error(tile.level).max(bounds.mesh_error());
+        let error = self.config.drawn_error(tile.level).max(bounds.mesh_error());
         let error_px = self.view.screen_space_error(bounds, error);
         self.selected.insert(tile, error_px);
         if tile.level < self.max_level && error_px > self.threshold_px {
@@ -335,10 +350,49 @@ pub fn select_tiles(
     }
 }
 
+/// The level-`level` tile of `face` containing face coordinates `(u, v)`.
+pub fn tile_containing(face: Face, u: f64, v: f64, level: u8) -> TileId {
+    let side = 1u32 << level;
+    let index = |t: f64| (((t + 1.0) * 0.5 * side as f64).max(0.0) as u32).min(side - 1);
+    TileId { face, level, x: index(u), y: index(v) }
+}
+
+/// Level of the coarsest tile in `selected` that shares an edge with `tile`, including across cube faces.
+fn coarsest_neighbour_level(tile: TileId, selected: &HashSet<TileId>, max_level: u8) -> Option<u8> {
+    let (u0, u1, v0, v1) = tile_face_bounds(tile.level, tile.x, tile.y)?;
+    let (um, vm) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+    let step = (u1 - u0) * 1e-3;
+    // Edge midpoints, each with a step back into the tile; a coarser neighbour covers the whole edge.
+    let edges = [((u0, vm), (step, 0.0)), ((u1, vm), (-step, 0.0)), ((um, v0), (0.0, step)), ((um, v1), (0.0, -step))];
+    edges
+        .into_iter()
+        .filter_map(|((u, v), (du, dv))| {
+            let edge = cube_to_unit(tile.face, u, v);
+            let (face, nu, nv) = unit_to_cube(edge * 2.0 - cube_to_unit(tile.face, u + du, v + dv));
+            (0..=max_level).map(|level| tile_containing(face, nu, nv, level)).find(|t| selected.contains(t))
+        })
+        .map(|t| t.level)
+        .min()
+}
+
+/// Skirt depth in metres for each tile of a selection. Two tiles' edges differ by at most the sum of their drawn
+/// errors, so a skirt reaching down by its own error plus its coarsest neighbour's closes any crack.
+pub fn skirt_depths(tiles: &[TileId], config: &LodConfig) -> Vec<f64> {
+    let selected: HashSet<_> = tiles.iter().copied().collect();
+    let max_level = tiles.iter().map(|t| t.level).max().unwrap_or(0);
+    tiles
+        .iter()
+        .map(|&tile| {
+            let coarsest = coarsest_neighbour_level(tile, &selected, max_level).map_or(tile.level, |l| l.min(tile.level));
+            config.drawn_error(tile.level) + config.drawn_error(coarsest)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{latlon_to_unit, tile_vertices, unit_to_cube};
+    use crate::geometry::{latlon_to_unit, tile_vertices};
 
     const ASPECT: f64 = 16.0 / 9.0;
     const HEIGHT_PX: u32 = 1080;
@@ -367,9 +421,7 @@ mod tests {
 
     fn tile_at(point: DVec3, level: u8) -> TileId {
         let (face, u, v) = unit_to_cube(point);
-        let side = 1u32 << level;
-        let index = |t: f64| (((t + 1.0) * 0.5 * side as f64) as u32).min(side - 1);
-        TileId { face, level, x: index(u), y: index(v) }
+        tile_containing(face, u, v, level)
     }
 
     /// Surface points hit by rays through a 65×37 grid spanning the viewport.
@@ -434,7 +486,7 @@ mod tests {
             // Tight enough to cull well: within 1% of the farthest grid vertex.
             let (origin, vertices) = tile_vertices(tile.face, tile.level, tile.x, tile.y, TILE_SEGMENTS).unwrap();
             let farthest = vertices
-                .chunks(8)
+                .chunks(3)
                 .map(|v| angle_between(bounds.center_dir, origin + DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64)))
                 .fold(0.0, f64::max);
             assert!(bounds.angular_radius <= farthest * 1.01, "{tile:?}: radius not tight");
@@ -448,7 +500,7 @@ mod tests {
             let bounds = TileBounds::new(tile);
             let (origin, vertices) = tile_vertices(tile.face, tile.level, tile.x, tile.y, TILE_SEGMENTS).unwrap();
             let p: Vec<DVec3> =
-                vertices.chunks(8).map(|v| origin + DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64)).collect();
+                vertices.chunks(3).map(|v| origin + DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64)).collect();
             let mut worst = 0.0f64;
             for j in 0..side - 1 {
                 for i in 0..side - 1 {
@@ -538,7 +590,7 @@ mod tests {
         let unbounded = LodConfig { max_visible_tiles: usize::MAX, ..LodConfig::default() };
         for (distance, elevation, camera) in all_views() {
             let tiles = select(&camera, &config, all_ready).tiles;
-            assert!(tiles.len() <= MAX_VISIBLE_TILES / 4, "{distance} m at {elevation}°: {} tiles", tiles.len());
+            assert!(tiles.len() <= MAX_VISIBLE_TILES / 2, "{distance} m at {elevation}°: {} tiles", tiles.len());
             assert_eq!(tiles, select(&camera, &unbounded, all_ready).tiles, "{distance} m at {elevation}°: budget-limited");
         }
     }
@@ -631,5 +683,41 @@ mod tests {
         assert_eq!(config.terrain_error(7), V2_TERRAIN_ERROR_M[7]);
         assert_eq!(config.terrain_error(8), V2_TERRAIN_ERROR_M[7] * 0.5);
         assert_eq!(config.terrain_error(9), V2_TERRAIN_ERROR_M[7] * 0.25);
+        assert_eq!(config.terrain_error(-1), V2_TERRAIN_ERROR_M[0] * 2.0);
+        assert_eq!(config.terrain_error(-2), V2_TERRAIN_ERROR_M[0] * 4.0);
+    }
+
+    #[test]
+    fn drawn_error_is_that_of_the_level_with_the_same_vertex_spacing() {
+        // 64 cells over 256 texels: every 4th texel, the spacing of the full grid two levels up.
+        assert_eq!((TILE_SIZE - 1) % TILE_SEGMENTS, 0);
+        assert_eq!(GRID_LEVEL_SHIFT, 2);
+        let config = LodConfig::default();
+        assert_eq!(config.drawn_error(7), V2_TERRAIN_ERROR_M[5]);
+        assert_eq!(config.drawn_error(2), V2_TERRAIN_ERROR_M[0]);
+        assert_eq!(config.drawn_error(0), V2_TERRAIN_ERROR_M[0] * 4.0);
+    }
+
+    #[test]
+    fn skirts_reach_down_to_the_coarsest_neighbour() {
+        let config = LodConfig::default();
+        let px = |level, x, y| TileId { face: Face::Px, level, x, y };
+        // px: three level-1 tiles, and the fourth (1, 1) split into level 2.
+        let tiles = [px(1, 0, 0), px(1, 1, 0), px(1, 0, 1), px(2, 2, 2), px(2, 3, 2), px(2, 2, 3), px(2, 3, 3)];
+        let depths = skirt_depths(&tiles, &config);
+        let (d1, d2) = (config.drawn_error(1), config.drawn_error(2));
+        assert_eq!(depths[..3], [2.0 * d1; 3]);
+        // (2, 2) borders level-1 tiles on its left and bottom; (3, 3) only touches its siblings and other faces,
+        // which are not selected here.
+        assert_eq!(depths[3], d2 + d1);
+        assert_eq!(depths[6], 2.0 * d2);
+
+        // Across faces: nz split into level 1, every other face whole. Each nz child borders two face roots.
+        let mut tiles: Vec<_> = [Face::Px, Face::Nx, Face::Py, Face::Ny, Face::Pz].map(TileId::root).to_vec();
+        tiles.extend(TileId::root(Face::Nz).children());
+        let depths = skirt_depths(&tiles, &config);
+        let d0 = config.drawn_error(0);
+        assert_eq!(depths[..5], [2.0 * d0; 5]);
+        assert_eq!(depths[5..], [d1 + d0; 4]);
     }
 }

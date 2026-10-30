@@ -12,11 +12,12 @@ pub const GPU_TILE_BUDGET_BYTES: u64 = 256 << 20;
 const MAX_ATTEMPTS: u8 = 3;
 const RETRY_BASE_MS: f64 = 1000.0;
 
-/// GPU bytes held by one resident tile: RGBA8 albedo, `u16` DEM and the 32-byte vertices of its grid.
+/// GPU bytes held by one resident tile: RGBA8 albedo, `u16` DEM and the 12-byte vertex offsets of its grid and
+/// skirt ring.
 pub const fn tile_gpu_bytes() -> u64 {
     let texels = (TILE_SIZE * TILE_SIZE) as u64;
-    let vertices = ((TILE_SEGMENTS + 1) * (TILE_SEGMENTS + 1)) as u64;
-    texels * (4 + 2) + vertices * 32
+    let vertices = ((TILE_SEGMENTS + 1) * (TILE_SEGMENTS + 1) + 4 * TILE_SEGMENTS) as u64;
+    texels * (4 + 2) + vertices * 12
 }
 
 /// How a tile fetch ended.
@@ -268,7 +269,7 @@ mod tests {
             format!(r#"{{"level": {l}, "geometricError": 1, "tiles": [{}]}}"#, tiles.join(","))
         };
         let json = format!(
-            r#"{{"version": "v2", "tileSize": 257, "levels": [{{"level": 0, "geometricError": 1, "tiles": [{ROOTS}]}}, {}, {}]}}"#,
+            r#"{{"version": "v2", "tileSize": 257, "dem": {{"scale": 0.5, "offset": -9200}}, "levels": [{{"level": 0, "geometricError": 1, "tiles": [{ROOTS}]}}, {}, {}]}}"#,
             level(1),
             level(2)
         );
@@ -295,8 +296,9 @@ mod tests {
         // Two requests per tile; PLAN.md §6 allows 6-8 in flight.
         assert!((6..=8).contains(&(2 * MAX_IN_FLIGHT_TILES)));
         let capacity = GPU_TILE_BUDGET_BYTES / tile_gpu_bytes();
-        assert_eq!(tile_gpu_bytes(), 257 * 257 * 6 + 81 * 32);
-        assert!((600..=700).contains(&capacity), "{capacity}");
+        assert_eq!(tile_gpu_bytes(), 257 * 257 * 6 + (65 * 65 + 256) * 12);
+        assert_eq!(u64::from(crate::geometry::grid_vertex_count(TILE_SEGMENTS)) * 12, tile_gpu_bytes() - 257 * 257 * 6);
+        assert!((550..=650).contains(&capacity), "{capacity}");
     }
 
     #[test]
